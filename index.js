@@ -11,15 +11,13 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/send', async (req, res) => {
-  const { to, subject, text, fromName, fromEmail } = req.body;
+  const { to, subject, text } = req.body;
 
   if (!to || !subject || !text) {
     return res.status(400).json({ error: 'to, subject, and text are required' });
   }
 
-  const from = fromName && fromEmail
-    ? `${fromName} <${fromEmail}>`
-    : fromEmail || 'hayley@branditessex.com';
+  const from = 'Hayley at Brand It Essex <hayley@branditessex.com>';
 
   try {
     const response = await fetch('https://api.resend.com/emails', {
