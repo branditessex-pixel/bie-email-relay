@@ -19,7 +19,7 @@ app.post('/send', async (req, res) => {
 
   const from = fromName && fromEmail
     ? `${fromName} <${fromEmail}>`
-    : fromEmail || 'noreply@branditessex.com';
+    : fromEmail || 'hayley@branditessex.com';
 
   try {
     const response = await fetch('https://api.resend.com/emails', {
