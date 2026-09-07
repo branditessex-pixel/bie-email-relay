@@ -26,9 +26,9 @@ function makeToken(secret, email) {
 }
 
 function verifyToken(secret, email, token) {
-  if (!token) return false;
-  const expected = makeToken(secret, email);
+  if (!secret || !token || !email) return false;
   try {
+    const expected = makeToken(secret, email);
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(token));
   } catch (e) {
     return false;
@@ -101,12 +101,12 @@ function registerGroundworkRoutes(app, config) {
     const token = (req.query.token || (req.body && req.body.token) || '').toString();
     const campaignId = (req.query.campaignId || (req.body && req.body.campaignId) || '').toString();
 
-    if (!email || !verifyToken(unsubscribeSecret, email, token)) {
-      res.status(400);
-      return req.method === 'POST' ? res.end() : res.send(confirmationPage({ ok: false, email }));
-    }
-
     try {
+      if (!verifyToken(unsubscribeSecret, email, token)) {
+        res.status(400);
+        return req.method === 'POST' ? res.end() : res.send(confirmationPage({ ok: false, email }));
+      }
+
       if (shopifyDomain && shopifyAdminToken) {
         await updateShopifyMarketingConsent({ domain: shopifyDomain, adminToken: shopifyAdminToken, email, unsubscribe: true });
       }
