@@ -1,10 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const registerGroundworkRoutes = require('./groundwork-routes');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+registerGroundworkRoutes(app, {
+  shopifyDomain: process.env.SHOPIFY_STORE || process.env.SHOPIFY_DOMAIN,
+  shopifyAdminToken: process.env.SHOPIFY_ADMIN_TOKEN,
+  shopifyWebhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET,
+  unsubscribeSecret: process.env.UNSUBSCRIBE_SECRET
+});
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
