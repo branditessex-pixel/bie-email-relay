@@ -136,7 +136,13 @@ function registerGroundworkRoutes(app, config) {
   app.get('/track/click/:campaignId/:customerId/:url', async (req, res) => {
     const { campaignId, customerId, url } = req.params;
     const destination = decodeURIComponent(url);
-    await appendEvent(campaignId, { type: 'click', customerId, url: destination, at: new Date().toISOString() });
+    // ?block=... is optional and only present for links the Groundwork CRM's
+    // Designed Email block editor tagged with which block produced them —
+    // an ordinary link (Simple editor, or an older campaign sent before this
+    // existed) just has no block query param, and this falls back to
+    // `undefined` exactly as before.
+    const block = req.query.block || undefined;
+    await appendEvent(campaignId, { type: 'click', customerId, url: destination, block, at: new Date().toISOString() });
     res.redirect(302, destination);
   });
 
