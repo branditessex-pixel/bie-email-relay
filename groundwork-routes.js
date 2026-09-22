@@ -166,6 +166,34 @@ function registerGroundworkRoutes(app, config) {
       events
     });
   });
+
+  // ── Abandoned-cart email tracking ─────────────────────────────────────────
+  // Same open/click mechanism as campaigns above, reusing the exact same
+  // generic appendEvent/readEvents helpers — just keyed by an
+  // "abandoned_<checkout token>" id instead of a campaignId, so one cart's
+  // events never collide with a real campaign's.
+  app.get('/abandoned/track/open/:token', (req, res) => {
+    appendEvent(`abandoned_${req.params.token}`, { type: 'open', at: new Date().toISOString() });
+    res.set('Content-Type', 'image/gif');
+    res.set('Cache-Control', 'no-store');
+    res.send(TRANSPARENT_PIXEL);
+  });
+
+  app.get('/abandoned/track/click/:token/:link/:url', async (req, res) => {
+    const { token, link, url } = req.params;
+    const destination = decodeURIComponent(url);
+    await appendEvent(`abandoned_${token}`, { type: 'click', link, url: destination, at: new Date().toISOString() });
+    res.redirect(302, destination);
+  });
+
+  // Bulk read so the CRM can refresh every tracked cart's opens/clicks in one
+  // request per check instead of one per cart.
+  app.get('/abandoned/stats', (req, res) => {
+    const tokens = String(req.query.tokens || '').split(',').map((t) => t.trim()).filter(Boolean);
+    const out = {};
+    tokens.forEach((token) => { out[token] = readEvents(`abandoned_${token}`); });
+    res.json(out);
+  });
 }
 
 module.exports = registerGroundworkRoutes;
