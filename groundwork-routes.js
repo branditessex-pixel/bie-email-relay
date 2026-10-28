@@ -1,12 +1,19 @@
 /**
  * Groundwork CRM integration routes: campaign open/click tracking,
- * unsubscribe (with Shopify marketing-consent sync), and a stats endpoint
- * the CRM polls to build its campaign history table.
+ * unsubscribe (with Shopify marketing-consent sync), a stats endpoint
+ * the CRM polls to build its campaign history table, and a Meta Lead Gen
+ * webhook that stores incoming leads for the CRM to collect.
  *
  * Event storage is a flat JSON file per campaign under DATA_DIR — Railway's
  * filesystem is ephemeral across deploys/restarts, so this is a best-effort
  * log, not a durable database. Good enough for open/click/unsubscribe counts
  * that only need to survive between sends and the next redeploy.
+ *
+ * Meta leads are stored the same way under META_LEADS_FILE. The CRM polls
+ * GET /meta/leads/pending to consume them; once consumed they are gone.
+ * A Railway restart between a lead arriving and the CRM polling will lose
+ * that lead — acceptable at current volumes. If that ever matters, swap the
+ * JSON file for a Railway Postgres add-on.
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -20,6 +27,7 @@ const TRANSPARENT_PIXEL = Buffer.from(
 );
 
 const DATA_DIR = process.env.CAMPAIGN_DATA_DIR || path.join(__dirname, 'data', 'campaigns');
+const META_LEADS_FILE = process.env.META_LEADS_FILE || path.join(__dirname, 'data', 'meta-leads.json');
 
 function makeToken(secret, email) {
   return crypto.createHmac('sha256', secret).update(email.trim().toLowerCase()).digest('hex');
@@ -93,8 +101,33 @@ function appendEvent(campaignId, event) {
   return writeQueue;
 }
 
+// ── Meta Lead Gen pending store ────────────────────────────────────────────
+let metaWriteQueue = Promise.resolve();
+
+function readMetaLeads() {
+  try { return JSON.parse(fs.readFileSync(META_LEADS_FILE, 'utf8')); } catch { return []; }
+}
+
+function appendMetaLead(lead) {
+  metaWriteQueue = metaWriteQueue.then(() => {
+    fs.mkdirSync(path.dirname(META_LEADS_FILE), { recursive: true });
+    const leads = readMetaLeads();
+    leads.push(lead);
+    fs.writeFileSync(META_LEADS_FILE, JSON.stringify(leads));
+  }).catch((e) => console.error('[groundwork] meta lead write failed', e));
+  return metaWriteQueue;
+}
+
+function flushMetaLeads() {
+  const leads = readMetaLeads();
+  fs.mkdirSync(path.dirname(META_LEADS_FILE), { recursive: true });
+  fs.writeFileSync(META_LEADS_FILE, JSON.stringify([]));
+  return leads;
+}
+
 function registerGroundworkRoutes(app, config) {
-  const { shopifyDomain, shopifyAdminToken, shopifyWebhookSecret, unsubscribeSecret } = config;
+  const { shopifyDomain, shopifyAdminToken, shopifyWebhookSecret, unsubscribeSecret,
+          metaLeadVerifyToken, metaAppSecret, metaAccessToken, metaLeadsSecret } = config;
 
   async function handleUnsubscribe(req, res) {
     const email = (req.query.email || (req.body && req.body.email) || '').toString();
@@ -167,32 +200,65 @@ function registerGroundworkRoutes(app, config) {
     });
   });
 
-  // ── Abandoned-cart email tracking ─────────────────────────────────────────
-  // Same open/click mechanism as campaigns above, reusing the exact same
-  // generic appendEvent/readEvents helpers — just keyed by an
-  // "abandoned_<checkout token>" id instead of a campaignId, so one cart's
-  // events never collide with a real campaign's.
-  app.get('/abandoned/track/open/:token', (req, res) => {
-    appendEvent(`abandoned_${req.params.token}`, { type: 'open', at: new Date().toISOString() });
-    res.set('Content-Type', 'image/gif');
-    res.set('Cache-Control', 'no-store');
-    res.send(TRANSPARENT_PIXEL);
+  // ── Meta Lead Gen webhook ────────────────────────────────────────────────
+  // Step 1: Meta verifies the endpoint with a GET challenge when you first
+  // register the webhook in the Meta App dashboard.
+  app.get('/meta/lead', (req, res) => {
+    if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === metaLeadVerifyToken) {
+      return res.status(200).send(req.query['hub.challenge']);
+    }
+    res.status(403).end();
   });
 
-  app.get('/abandoned/track/click/:token/:link/:url', async (req, res) => {
-    const { token, link, url } = req.params;
-    const destination = decodeURIComponent(url);
-    await appendEvent(`abandoned_${token}`, { type: 'click', link, url: destination, at: new Date().toISOString() });
-    res.redirect(302, destination);
+  // Step 2: Meta POSTs a notification when a lead submits the form.
+  // We verify the signature, fetch the actual field data from the Graph API,
+  // and store it for the CRM to collect.
+  app.post('/meta/lead', express.raw({ type: 'application/json' }), async (req, res) => {
+    if (metaAppSecret) {
+      const sig = req.get('X-Hub-Signature-256') || '';
+      const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(req.body).digest('hex');
+      if (sig !== expected) return res.status(401).end();
+    }
+    res.status(200).end();
+
+    try {
+      const payload = JSON.parse(req.body.toString());
+      const change = (payload.entry && payload.entry[0] && payload.entry[0].changes && payload.entry[0].changes[0]) || {};
+      const leadgenId = change.value && change.value.leadgen_id;
+      if (!leadgenId || !metaAccessToken) return;
+
+      const r = await fetch(
+        `https://graph.facebook.com/v21.0/${leadgenId}?fields=field_data,created_time&access_token=${metaAccessToken}`
+      );
+      if (!r.ok) { console.error('[groundwork] meta graph fetch failed', r.status); return; }
+      const data = await r.json();
+
+      const fields = {};
+      for (const f of (data.field_data || [])) fields[f.name] = (f.values && f.values[0]) || '';
+
+      const lead = {
+        leadgenId,
+        receivedAt: new Date().toISOString(),
+        name: fields.full_name || [fields.first_name, fields.last_name].filter(Boolean).join(' ').trim() || null,
+        email: fields.email || null,
+        phone: fields.phone_number || fields.phone || null,
+        company: fields.company_name || fields.business_name || null,
+        need: fields.what_are_you_looking_for || fields.workwear_type || null,
+        quantity: fields.how_many_staff || fields.quantity || null,
+      };
+
+      await appendMetaLead(lead);
+    } catch (e) {
+      console.error('[groundwork] meta lead processing failed', e);
+    }
   });
 
-  // Bulk read so the CRM can refresh every tracked cart's opens/clicks in one
-  // request per check instead of one per cart.
-  app.get('/abandoned/stats', (req, res) => {
-    const tokens = String(req.query.tokens || '').split(',').map((t) => t.trim()).filter(Boolean);
-    const out = {};
-    tokens.forEach((token) => { out[token] = readEvents(`abandoned_${token}`); });
-    res.json(out);
+  // Step 3: The CRM polls this endpoint every 10 minutes, consumes pending
+  // leads, and injects them into the local leads store.
+  app.get('/meta/leads/pending', (req, res) => {
+    const secret = metaLeadsSecret || metaLeadVerifyToken;
+    if (!secret || req.query.secret !== secret) return res.status(401).end();
+    res.json(flushMetaLeads());
   });
 }
 

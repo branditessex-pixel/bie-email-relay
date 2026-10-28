@@ -11,7 +11,11 @@ registerGroundworkRoutes(app, {
   shopifyDomain: process.env.SHOPIFY_STORE || process.env.SHOPIFY_DOMAIN,
   shopifyAdminToken: process.env.SHOPIFY_ADMIN_TOKEN,
   shopifyWebhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET,
-  unsubscribeSecret: process.env.UNSUBSCRIBE_SECRET
+  unsubscribeSecret: process.env.UNSUBSCRIBE_SECRET,
+  metaLeadVerifyToken: process.env.META_VERIFY_TOKEN,
+  metaAppSecret: process.env.META_APP_SECRET,
+  metaAccessToken: process.env.META_ACCESS_TOKEN,
+  metaLeadsSecret: process.env.META_LEADS_SECRET,
 });
 
 app.get('/health', (req, res) => {
