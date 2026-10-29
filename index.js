@@ -5,7 +5,9 @@ const registerGroundworkRoutes = require('./groundwork-routes');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Keep the exact bytes of every JSON body: Meta signs the raw payload, and the
+// parsed object cannot be used to check that signature.
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 registerGroundworkRoutes(app, {
   shopifyDomain: process.env.SHOPIFY_STORE || process.env.SHOPIFY_DOMAIN,
@@ -52,6 +54,11 @@ app.post('/send', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// A bug in one request must never take tracking, unsubscribes and the CRM's
+// results offline, so log it and carry on instead of letting the process die.
+process.on('unhandledRejection', (e) => console.error('[relay] unhandled rejection', e));
+process.on('uncaughtException', (e) => console.error('[relay] uncaught exception', e));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
