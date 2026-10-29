@@ -179,9 +179,10 @@ function registerGroundworkRoutes(app, config) {
     res.redirect(302, destination);
   });
 
-  app.post('/shopify/webhook/customers/update', express.raw({ type: 'application/json' }), async (req, res) => {
+  app.post('/shopify/webhook/customers/update', async (req, res) => {
     const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    const digest = crypto.createHmac('sha256', shopifyWebhookSecret || '').update(req.body).digest('base64');
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const digest = crypto.createHmac('sha256', shopifyWebhookSecret || '').update(raw).digest('base64');
     if (!shopifyWebhookSecret || !hmacHeader || digest !== hmacHeader) {
       return res.status(401).end();
     }
@@ -200,6 +201,34 @@ function registerGroundworkRoutes(app, config) {
     });
   });
 
+  // ── Abandoned-cart email tracking ─────────────────────────────────────────
+  // Same open/click mechanism as campaigns above, reusing the exact same
+  // generic appendEvent/readEvents helpers — just keyed by an
+  // "abandoned_<checkout token>" id instead of a campaignId, so one cart's
+  // events never collide with a real campaign's.
+  app.get('/abandoned/track/open/:token', (req, res) => {
+    appendEvent(`abandoned_${req.params.token}`, { type: 'open', at: new Date().toISOString() });
+    res.set('Content-Type', 'image/gif');
+    res.set('Cache-Control', 'no-store');
+    res.send(TRANSPARENT_PIXEL);
+  });
+
+  app.get('/abandoned/track/click/:token/:link/:url', async (req, res) => {
+    const { token, link, url } = req.params;
+    const destination = decodeURIComponent(url);
+    await appendEvent(`abandoned_${token}`, { type: 'click', link, url: destination, at: new Date().toISOString() });
+    res.redirect(302, destination);
+  });
+
+  // Bulk read so the CRM can refresh every tracked cart's opens/clicks in one
+  // request per check instead of one per cart.
+  app.get('/abandoned/stats', (req, res) => {
+    const tokens = String(req.query.tokens || '').split(',').map((t) => t.trim()).filter(Boolean);
+    const out = {};
+    tokens.forEach((token) => { out[token] = readEvents(`abandoned_${token}`); });
+    res.json(out);
+  });
+
   // ── Meta Lead Gen webhook ────────────────────────────────────────────────
   // Step 1: Meta verifies the endpoint with a GET challenge when you first
   // register the webhook in the Meta App dashboard.
@@ -213,16 +242,19 @@ function registerGroundworkRoutes(app, config) {
   // Step 2: Meta POSTs a notification when a lead submits the form.
   // We verify the signature, fetch the actual field data from the Graph API,
   // and store it for the CRM to collect.
-  app.post('/meta/lead', express.raw({ type: 'application/json' }), async (req, res) => {
+  app.post('/meta/lead', async (req, res) => {
+    // index.js parses the JSON body and keeps the original bytes in rawBody.
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
     if (metaAppSecret) {
       const sig = req.get('X-Hub-Signature-256') || '';
-      const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(req.body).digest('hex');
-      if (sig !== expected) return res.status(401).end();
+      const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
+      const a = Buffer.from(sig); const b = Buffer.from(expected);
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).end();
     }
     res.status(200).end();
 
     try {
-      const payload = JSON.parse(req.body.toString());
+      const payload = req.body && typeof req.body === 'object' ? req.body : JSON.parse(raw.toString());
       const change = (payload.entry && payload.entry[0] && payload.entry[0].changes && payload.entry[0].changes[0]) || {};
       const leadgenId = change.value && change.value.leadgen_id;
       if (!leadgenId || !metaAccessToken) return;
