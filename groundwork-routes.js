@@ -113,7 +113,7 @@ function appendEvent(campaignId, event) {
 function envSecret(name) {
   const value = process.env[name];
   if (typeof value !== 'string' || value.trim() === '') return '';
-  return value;
+  return value.trim();
 }
 
 let warnedMetaVerify = false;
@@ -324,9 +324,13 @@ function registerGroundworkRoutes(app, config) {
       }
       return res.status(401).end();
     }
-    const sig = req.get('X-Hub-Signature-256') || '';
+    const header = req.get('X-Hub-Signature-256');
+    const sig = header || '';
     const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
-    if (!safeEqual(sig, expected)) return res.status(401).end();
+    if (!safeEqual(sig, expected)) {
+      console.warn(`[relay] Meta signature mismatch: header present=${Boolean(header)}, header prefix ok=${sig.startsWith('sha256=')}, body bytes=${raw.length}, rawBody captured=${!!req.rawBody}, secret length=${metaAppSecret.length}`);
+      return res.status(401).end();
+    }
 
     let payload;
     try {
