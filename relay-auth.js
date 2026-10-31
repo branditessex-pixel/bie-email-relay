@@ -1,7 +1,7 @@
 /**
  * Shared secret for routes the Groundwork CRM calls directly.
- * Tracking pixels, click redirects, unsubscribe, /health, and the Meta
- * lead webhook do not use this check.
+ * Email pixels, click redirects, and unsubscribe links cannot send this
+ * header; those use link-sign.js. Provider webhooks keep their own checks.
  *
  * Callers send the secret in X-Relay-Key, or as Authorization: Bearer <key>.
  * RELAY_API_KEY must be set; otherwise these routes fail closed.
@@ -15,7 +15,7 @@ function relayApiKey() {
 }
 
 const MISSING_KEY_WARNING =
-  '[relay] RELAY_API_KEY is not set; refusing POST /send and GET /campaigns/:campaignId/stats until it is configured';
+  '[relay] RELAY_API_KEY is not set; refusing POST /send, GET /campaigns/:campaignId/stats, GET /abandoned/stats, and GET /meta/leads/pending until it is configured';
 
 function warnIfRelayKeyMissing() {
   if (!relayApiKey()) console.warn(MISSING_KEY_WARNING);
@@ -30,7 +30,7 @@ function keyFromRequest(req) {
 }
 
 // Hash both sides so the comparison stays constant-time when the lengths differ.
-function keysMatch(provided, expected) {
+function safeEqual(provided, expected) {
   const actual = crypto.createHash('sha256').update(String(provided), 'utf8').digest();
   const want = crypto.createHash('sha256').update(String(expected), 'utf8').digest();
   return crypto.timingSafeEqual(actual, want);
@@ -42,7 +42,7 @@ function requireRelayKey(req, res, next) {
     console.warn(MISSING_KEY_WARNING);
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  if (!keysMatch(keyFromRequest(req), expected)) {
+  if (!safeEqual(keyFromRequest(req), expected)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   return next();
@@ -52,4 +52,5 @@ module.exports = {
   requireRelayKey,
   warnIfRelayKeyMissing,
   MISSING_KEY_WARNING,
+  safeEqual,
 };

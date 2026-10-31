@@ -20,7 +20,15 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const fetch = require('node-fetch');
-const { requireRelayKey } = require('./relay-auth');
+const { requireRelayKey, safeEqual } = require('./relay-auth');
+const {
+  assessLink,
+  linkRejected,
+  noteUnsignedLink,
+  noteRejectedLink,
+  noteClickRewritten,
+  resolveClickRedirect,
+} = require('./link-sign');
 
 const TRANSPARENT_PIXEL = Buffer.from(
   'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBTAA7',
@@ -126,14 +134,51 @@ function flushMetaLeads() {
   return leads;
 }
 
+// Secrets are read per request so a missing value fails closed even if the
+// process was started with an empty variable and so tests can exercise both.
+function envSecret(name) {
+  const value = process.env[name];
+  if (typeof value !== 'string' || value.trim() === '') return '';
+  return value;
+}
+
+let warnedMetaVerify = false;
+let warnedMetaApp = false;
+let warnedShopifyWebhook = false;
+
+function rejectPublicLink(res) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(403).json({ error: 'Invalid link' });
+}
+
+function decodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return '';
+  }
+}
+
 function registerGroundworkRoutes(app, config) {
-  const { shopifyDomain, shopifyAdminToken, shopifyWebhookSecret, unsubscribeSecret,
-          metaLeadVerifyToken, metaAppSecret, metaAccessToken, metaLeadsSecret } = config;
+  const { shopifyDomain, shopifyAdminToken } = config;
 
   async function handleUnsubscribe(req, res) {
-    const email = (req.query.email || (req.body && req.body.email) || '').toString();
-    const token = (req.query.token || (req.body && req.body.token) || '').toString();
-    const campaignId = (req.query.campaignId || (req.body && req.body.campaignId) || '').toString();
+    const link = assessLink(req);
+    const route = `${req.method} /unsubscribe`;
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      res.status(403);
+      return req.method === 'POST' ? res.end() : res.send(confirmationPage({ ok: false }));
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
+
+    // A signed link covers the query string only. Ignore body fields then, so a
+    // signed URL cannot be reused to unsubscribe a different address.
+    const body = link.status === 'signed' ? {} : (req.body || {});
+    const email = (req.query.email || body.email || '').toString();
+    const token = (req.query.token || body.token || '').toString();
+    const campaignId = (req.query.campaignId || body.campaignId || '').toString();
+    const unsubscribeSecret = envSecret('UNSUBSCRIBE_SECRET');
 
     try {
       if (!verifyToken(unsubscribeSecret, email, token)) {
@@ -160,6 +205,13 @@ function registerGroundworkRoutes(app, config) {
   app.post('/unsubscribe', express.urlencoded({ extended: false }), handleUnsubscribe);
 
   app.get('/track/open/:campaignId/:customerId', async (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /track/open/:campaignId/:customerId';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     const { campaignId, customerId } = req.params;
     appendEvent(campaignId, { type: 'open', customerId, at: new Date().toISOString() });
     res.set('Content-Type', 'image/gif');
@@ -168,25 +220,40 @@ function registerGroundworkRoutes(app, config) {
   });
 
   app.get('/track/click/:campaignId/:customerId/:url', async (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /track/click/:campaignId/:customerId/:url';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     const { campaignId, customerId, url } = req.params;
-    const destination = decodeURIComponent(url);
+    const destination = decodeParam(url);
     // ?block=... is optional and only present for links the Groundwork CRM's
     // Designed Email block editor tagged with which block produced them —
     // an ordinary link (Simple editor, or an older campaign sent before this
     // existed) just has no block query param, and this falls back to
     // `undefined` exactly as before.
     const block = req.query.block || undefined;
+    const target = resolveClickRedirect(destination, { trusted: link.status === 'signed' });
+    if (!target.toDestination) noteClickRewritten(target.host);
     await appendEvent(campaignId, { type: 'click', customerId, url: destination, block, at: new Date().toISOString() });
-    res.redirect(302, destination);
+    res.redirect(302, target.location);
   });
 
   app.post('/shopify/webhook/customers/update', async (req, res) => {
-    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-    const digest = crypto.createHmac('sha256', shopifyWebhookSecret || '').update(raw).digest('base64');
-    if (!shopifyWebhookSecret || !hmacHeader || digest !== hmacHeader) {
+    const shopifyWebhookSecret = envSecret('SHOPIFY_WEBHOOK_SECRET');
+    if (!shopifyWebhookSecret) {
+      if (!warnedShopifyWebhook) {
+        warnedShopifyWebhook = true;
+        console.warn('[relay] SHOPIFY_WEBHOOK_SECRET is not set; rejecting Shopify customer webhooks');
+      }
       return res.status(401).end();
     }
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const digest = crypto.createHmac('sha256', shopifyWebhookSecret).update(raw).digest('base64');
+    if (!hmacHeader || !safeEqual(hmacHeader, digest)) return res.status(401).end();
     res.status(200).end();
   });
 
@@ -208,6 +275,13 @@ function registerGroundworkRoutes(app, config) {
   // "abandoned_<checkout token>" id instead of a campaignId, so one cart's
   // events never collide with a real campaign's.
   app.get('/abandoned/track/open/:token', (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /abandoned/track/open/:token';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     appendEvent(`abandoned_${req.params.token}`, { type: 'open', at: new Date().toISOString() });
     res.set('Content-Type', 'image/gif');
     res.set('Cache-Control', 'no-store');
@@ -215,15 +289,24 @@ function registerGroundworkRoutes(app, config) {
   });
 
   app.get('/abandoned/track/click/:token/:link/:url', async (req, res) => {
-    const { token, link, url } = req.params;
-    const destination = decodeURIComponent(url);
-    await appendEvent(`abandoned_${token}`, { type: 'click', link, url: destination, at: new Date().toISOString() });
-    res.redirect(302, destination);
+    const link = assessLink(req);
+    const route = 'GET /abandoned/track/click/:token/:link/:url';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
+    const { token, link: linkName, url } = req.params;
+    const destination = decodeParam(url);
+    const target = resolveClickRedirect(destination, { trusted: link.status === 'signed' });
+    if (!target.toDestination) noteClickRewritten(target.host);
+    await appendEvent(`abandoned_${token}`, { type: 'click', link: linkName, url: destination, at: new Date().toISOString() });
+    res.redirect(302, target.location);
   });
 
   // Bulk read so the CRM can refresh every tracked cart's opens/clicks in one
   // request per check instead of one per cart.
-  app.get('/abandoned/stats', (req, res) => {
+  app.get('/abandoned/stats', requireRelayKey, (req, res) => {
     const tokens = String(req.query.tokens || '').split(',').map((t) => t.trim()).filter(Boolean);
     const out = {};
     tokens.forEach((token) => { out[token] = readEvents(`abandoned_${token}`); });
@@ -234,10 +317,21 @@ function registerGroundworkRoutes(app, config) {
   // Step 1: Meta verifies the endpoint with a GET challenge when you first
   // register the webhook in the Meta App dashboard.
   app.get('/meta/lead', (req, res) => {
-    if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === metaLeadVerifyToken) {
-      return res.status(200).send(req.query['hub.challenge']);
+    const metaLeadVerifyToken = envSecret('META_VERIFY_TOKEN');
+    const provided = req.query['hub.verify_token'];
+    if (!metaLeadVerifyToken) {
+      if (!warnedMetaVerify) {
+        warnedMetaVerify = true;
+        console.warn('[relay] META_VERIFY_TOKEN is not set; rejecting Meta webhook verification challenges');
+      }
+      return res.status(403).end();
     }
-    res.status(403).end();
+    if (req.query['hub.mode'] !== 'subscribe' || typeof provided !== 'string' || !safeEqual(provided, metaLeadVerifyToken)) {
+      return res.status(403).end();
+    }
+    const challenge = req.query['hub.challenge'];
+    if (typeof challenge !== 'string') return res.status(403).end();
+    return res.status(200).send(challenge);
   });
 
   // Step 2: Meta POSTs a notification when a lead submits the form.
@@ -245,19 +339,25 @@ function registerGroundworkRoutes(app, config) {
   // and store it for the CRM to collect.
   app.post('/meta/lead', async (req, res) => {
     // index.js parses the JSON body and keeps the original bytes in rawBody.
+    const metaAppSecret = envSecret('META_APP_SECRET');
     const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-    if (metaAppSecret) {
-      const sig = req.get('X-Hub-Signature-256') || '';
-      const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
-      const a = Buffer.from(sig); const b = Buffer.from(expected);
-      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).end();
+    if (!metaAppSecret) {
+      if (!warnedMetaApp) {
+        warnedMetaApp = true;
+        console.warn('[relay] META_APP_SECRET is not set; rejecting Meta lead webhooks');
+      }
+      return res.status(401).end();
     }
+    const sig = req.get('X-Hub-Signature-256') || '';
+    const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
+    if (!safeEqual(sig, expected)) return res.status(401).end();
     res.status(200).end();
 
     try {
       const payload = req.body && typeof req.body === 'object' ? req.body : JSON.parse(raw.toString());
       const change = (payload.entry && payload.entry[0] && payload.entry[0].changes && payload.entry[0].changes[0]) || {};
       const leadgenId = change.value && change.value.leadgen_id;
+      const metaAccessToken = envSecret('META_ACCESS_TOKEN');
       if (!leadgenId || !metaAccessToken) return;
 
       const r = await fetch(
@@ -288,9 +388,7 @@ function registerGroundworkRoutes(app, config) {
 
   // Step 3: The CRM polls this endpoint every 10 minutes, consumes pending
   // leads, and injects them into the local leads store.
-  app.get('/meta/leads/pending', (req, res) => {
-    const secret = metaLeadsSecret || metaLeadVerifyToken;
-    if (!secret || req.query.secret !== secret) return res.status(401).end();
+  app.get('/meta/leads/pending', requireRelayKey, (req, res) => {
     res.json(flushMetaLeads());
   });
 }

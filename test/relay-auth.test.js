@@ -173,16 +173,22 @@ describe('relay shared secret', { concurrency: false }, () => {
 
     const click = await request('GET', '/track/click/pixelcamp/someone/' + encodeURIComponent('https://example.com/x'));
     assert.equal(click.status, 302);
-    assert.equal(click.headers.location, 'https://example.com/x');
+    assert.equal(click.headers.location, 'https://branditessex.com/');
+
+    const shopClick = await request('GET', '/track/click/pixelcamp/someone/' + encodeURIComponent('https://branditessex.com/products/polo'));
+    assert.equal(shopClick.status, 302);
+    assert.equal(shopClick.headers.location, 'https://branditessex.com/products/polo');
 
     const abandonedPixel = await request('GET', '/abandoned/track/open/tok');
     assert.equal(abandonedPixel.status, 200);
 
     const abandonedClick = await request('GET', '/abandoned/track/click/tok/cart/' + encodeURIComponent('https://example.com/cart'));
     assert.equal(abandonedClick.status, 302);
+    assert.equal(abandonedClick.headers.location, 'https://branditessex.com/');
 
     const abandonedStats = await request('GET', '/abandoned/stats?tokens=tok');
-    assert.equal(abandonedStats.status, 200);
+    assert.equal(abandonedStats.status, 401);
+    assert.deepEqual(abandonedStats.json, { error: 'Unauthorized' });
 
     const unsub = await request('GET', '/unsubscribe?email=person@example.com&token=bad');
     assert.equal(unsub.status, 400);
@@ -197,6 +203,31 @@ describe('relay shared secret', { concurrency: false }, () => {
 
     const pending = await request('GET', '/meta/leads/pending');
     assert.equal(pending.status, 401);
-    assert.equal(pending.text, '');
+    assert.deepEqual(pending.json, { error: 'Unauthorized' });
+
+    const routes = [];
+    app._router.stack.forEach((layer) => {
+      if (!layer.route) return;
+      for (const method of Object.keys(layer.route.methods)) {
+        if (layer.route.methods[method]) routes.push(`${method.toUpperCase()} ${layer.route.path}`);
+      }
+    });
+    routes.sort();
+    assert.deepEqual(routes, [
+      'GET /abandoned/stats',
+      'GET /abandoned/track/click/:token/:link/:url',
+      'GET /abandoned/track/open/:token',
+      'GET /campaigns/:campaignId/stats',
+      'GET /health',
+      'GET /meta/lead',
+      'GET /meta/leads/pending',
+      'GET /track/click/:campaignId/:customerId/:url',
+      'GET /track/open/:campaignId/:customerId',
+      'GET /unsubscribe',
+      'POST /meta/lead',
+      'POST /send',
+      'POST /shopify/webhook/customers/update',
+      'POST /unsubscribe',
+    ]);
   });
 });
