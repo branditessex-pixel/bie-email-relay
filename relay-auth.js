@@ -15,7 +15,7 @@ function relayApiKey() {
 }
 
 const MISSING_KEY_WARNING =
-  '[relay] RELAY_API_KEY is not set; refusing POST /send, GET /campaigns/:campaignId/stats, GET /abandoned/stats, and GET /meta/leads/pending until it is configured';
+  '[relay] RELAY_API_KEY is not set; refusing POST /send, GET /campaigns/:campaignId/stats, GET /abandoned/stats, GET /meta/leads/pending, and POST /meta/leads/ack until it is configured';
 
 function warnIfRelayKeyMissing() {
   if (!relayApiKey()) console.warn(MISSING_KEY_WARNING);

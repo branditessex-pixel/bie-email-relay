@@ -12,7 +12,8 @@ Express also answers `HEAD` for each `GET` route with the same handler and the s
 | `POST` | `/send` | `RELAY_API_KEY` | Sends one email through Resend from Hayley at Brand It Essex. |
 | `GET` | `/campaigns/:campaignId/stats` | `RELAY_API_KEY` | Unique open, click, and unsubscribe counts, plus the raw event list. |
 | `GET` | `/abandoned/stats` | `RELAY_API_KEY` | Raw open/click events for the checkout tokens in `?tokens=`. |
-| `GET` | `/meta/leads/pending` | `RELAY_API_KEY` | Returns pending Meta leads and deletes them. The old `?secret=` query is not accepted. |
+| `GET` | `/meta/leads/pending` | `RELAY_API_KEY` | Returns pending Meta leads. Each lead includes `leadgenId`. Does not delete them. The old `?secret=` query is not accepted. |
+| `POST` | `/meta/leads/ack` | `RELAY_API_KEY` | Body `{ "leadgenIds": ["..."] }`. Removes only those ids. Same `X-Relay-Key` or Bearer check as pending. The old `?secret=` query is not accepted. |
 | `GET` | `/track/open/:campaignId/:customerId` | Link signature | Records an open and returns a 1×1 gif. |
 | `GET` | `/track/click/:campaignId/:customerId/:url` | Link signature | Records a click and redirects. Unsigned destinations must be on the host allowlist. |
 | `GET` | `/abandoned/track/open/:token` | Link signature | Records an abandoned-cart open and returns the gif. |
@@ -20,7 +21,7 @@ Express also answers `HEAD` for each `GET` route with the same handler and the s
 | `GET` | `/unsubscribe` | Link signature + per-email token | Confirms unsubscribe and, when Shopify env is set, updates marketing consent. |
 | `POST` | `/unsubscribe` | Link signature + per-email token | RFC 8058 one-click unsubscribe. Same checks as `GET`. |
 | `GET` | `/meta/lead` | `META_VERIFY_TOKEN` | Meta hub challenge. The token is required; a missing token does not echo `hub.challenge`. |
-| `POST` | `/meta/lead` | `META_APP_SECRET` HMAC | Meta lead webhook. The app secret is required. The handler then reads the lead from the Graph API with `META_ACCESS_TOKEN`. |
+| `POST` | `/meta/lead` | `META_APP_SECRET` HMAC | Meta lead webhook. The app secret is required. The raw lead is stored, then fields are read from the Graph API with `META_ACCESS_TOKEN`. |
 | `POST` | `/shopify/webhook/customers/update` | `SHOPIFY_WEBHOOK_SECRET` HMAC | Checks Shopify's `X-Shopify-Hmac-Sha256` over the raw body and returns 200. |
 
 `RELAY_API_KEY` is not added to Meta or Shopify webhooks. Email pixels, click redirects, and unsubscribe links cannot send that header; they use the link signature below.
@@ -105,7 +106,17 @@ Shopify: HMAC-SHA256 of the raw body, base64, compared in constant time with `X-
 
 Meta challenge: `hub.mode=subscribe` and `hub.verify_token` must match `META_VERIFY_TOKEN` in constant time. The code reads `META_VERIFY_TOKEN`. It does not read `META_LEAD_VERIFY_TOKEN`. If the token is unset, the challenge is `403` and `hub.challenge` is not echoed.
 
-Meta lead POST: `X-Hub-Signature-256` must equal `sha256=` plus the hex HMAC-SHA256 of the raw body, keyed with `META_APP_SECRET`. If that secret is unset, the route returns `401` and does not store a lead. A valid call returns `200` before the Graph API read.
+Meta lead POST: `X-Hub-Signature-256` must equal `sha256=` plus the hex HMAC-SHA256 of the raw body, keyed with `META_APP_SECRET`. If that secret is unset, the route returns `401` and does not store a lead. A valid call stores every leadgen id in the body (form, page, and time included), skipping ids already stored, then tries the Graph field read, then returns `200`. A failed or skipped Graph read still returns `200` and keeps the raw lead. The route returns `500` only when the lead file cannot be written, so Meta retries.
+
+### Meta lead storage
+
+Pending leads are one JSON file, `$DATA_DIR/meta-leads.json`. Attach a Railway Volume mounted at `/data` and set `DATA_DIR=/data`. The container disk is wiped on restart and redeploy; the volume is not. When `DATA_DIR` is unset, the file stays at `./data/meta-leads.json`, which is the previous location. `META_LEADS_FILE` still names the file only when `DATA_DIR` is unset. Writes use a temp file in the same directory and then rename.
+
+`GET /meta/leads/pending` reloads that file, retries the Graph field fetch for any lead whose fields are not stored yet, and returns the list. It does not delete leads. Each object includes `leadgenId`. Webhook fields are `formId`, `pageId`, and `createdTime`. After a successful Graph read the object also has `name`, `email`, `phone`, `company`, `need`, and `quantity`, and `fieldsFetched` is `true`.
+
+`POST /meta/leads/ack` takes `{ "leadgenIds": ["123"] }` and removes only those ids. The check is the same `RELAY_API_KEY` header as pending (`X-Relay-Key`, or `Authorization: Bearer`). Unknown ids are ignored. Ack a lead after the CRM has stored it. Leave `fieldsFetched: false` unacked so the next poll can deliver the fields. Older app versions never ack: those leads are sent again on every poll, and the app de-dupes by `leadgenId`.
+
+Leads older than `META_LEADS_RETENTION_DAYS` (default 30, measured from `receivedAt`) are removed on read and on write so the file cannot grow forever. The hub verification token is read from `META_VERIFY_TOKEN`.
 
 ## Environment
 
@@ -113,7 +124,7 @@ Set these on the Railway service. Do not put the values in git.
 
 | Variable | Required | Used for |
 | --- | --- | --- |
-| `RELAY_API_KEY` | Yes, for CRM calls | `/send`, campaign stats, abandoned stats, pending Meta leads. Unset means those routes return `401`. |
+| `RELAY_API_KEY` | Yes, for CRM calls | `/send`, campaign stats, abandoned stats, `GET /meta/leads/pending`, and `POST /meta/leads/ack`. Unset means those routes return `401`. |
 | `RELAY_LINK_SECRET` | Yes, before strict mode | HMAC key for email-link `sig`. Unset keeps pixels and unsubscribe working and logs a warning. |
 | `RELAY_REQUIRE_SIGNED_LINKS` | Not yet | Set to exactly `true` only after the CRM signs links and old unsigned emails can expire. Default off. |
 | `RELAY_REDIRECT_ALLOWLIST` | No | Comma-separated click hosts. Default `branditessex.com,uvrvii-wd.myshopify.com`. |
@@ -123,12 +134,14 @@ Set these on the Railway service. Do not put the values in git.
 | `SHOPIFY_STORE` or `SHOPIFY_DOMAIN` | Yes, for consent sync | Shop hostname used for Admin API consent updates and added to the click allowlist. |
 | `SHOPIFY_ADMIN_TOKEN` | Yes, for consent sync | Shopify Admin API token. |
 | `SHOPIFY_WEBHOOK_SECRET` | Yes, for the webhook | Shopify customer-webhook HMAC. Unset means `401`. |
-| `META_VERIFY_TOKEN` | Yes, for the challenge | Meta `hub.verify_token`. Not `META_LEAD_VERIFY_TOKEN`. |
+| `META_VERIFY_TOKEN` | Yes, for the challenge | Meta `hub.verify_token`. The relay reads `META_VERIFY_TOKEN`, not `META_LEAD_VERIFY_TOKEN`. |
 | `META_APP_SECRET` | Yes, for lead posts | Meta `X-Hub-Signature-256`. Unset means `401`. |
-| `META_ACCESS_TOKEN` | Yes, to store lead fields | Graph API token. Without it a verified webhook is acknowledged and not stored. |
+| `META_ACCESS_TOKEN` | Yes, to fill lead fields | Graph API token. A verified webhook is still stored when this is missing or the Graph read fails. Fields are retried on the next pending read. |
+| `DATA_DIR` | Yes, so leads survive restarts | Directory for `meta-leads.json`. Attach a Railway Volume mounted at `/data` and set `DATA_DIR=/data`. When unset, the file stays at `./data/meta-leads.json`. |
+| `META_LEADS_RETENTION_DAYS` | No | Drop unacked leads older than this many days. Default 30. |
 | `PORT` | No | Listen port. Railway sets this. Default 3000. |
-| `CAMPAIGN_DATA_DIR` | No | Campaign event log directory. |
-| `META_LEADS_FILE` | No | Pending Meta leads file. |
+| `CAMPAIGN_DATA_DIR` | No | Campaign event log directory. Open and click counts only. |
+| `META_LEADS_FILE` | No | Full path of the leads file. Ignored when `DATA_DIR` is set. |
 
 `META_LEADS_SECRET` is not read. Pending leads use `RELAY_API_KEY`.
 

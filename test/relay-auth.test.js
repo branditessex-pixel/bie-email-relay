@@ -205,6 +205,10 @@ describe('relay shared secret', { concurrency: false }, () => {
     assert.equal(pending.status, 401);
     assert.deepEqual(pending.json, { error: 'Unauthorized' });
 
+    const ack = await request('POST', '/meta/leads/ack', { json: { leadgenIds: ['1'] } });
+    assert.equal(ack.status, 401);
+    assert.deepEqual(ack.json, { error: 'Unauthorized' });
+
     const routes = [];
     app._router.stack.forEach((layer) => {
       if (!layer.route) return;
@@ -225,6 +229,7 @@ describe('relay shared secret', { concurrency: false }, () => {
       'GET /track/open/:campaignId/:customerId',
       'GET /unsubscribe',
       'POST /meta/lead',
+      'POST /meta/leads/ack',
       'POST /send',
       'POST /shopify/webhook/customers/update',
       'POST /unsubscribe',

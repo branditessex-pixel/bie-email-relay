@@ -313,7 +313,10 @@ describe('public email links and webhooks', { concurrency: false }, () => {
     const fetched = await request('GET', '/meta/leads/pending', { headers: { authorization: `Bearer ${KEY}` } });
     assert.equal(fetched.status, 200);
     assert.equal(fetched.json[0].email, 'lead-secret@example.com');
-    assert.equal(fs.readFileSync(leadsFile, 'utf8'), '[]');
+    assert.equal(fs.readFileSync(leadsFile, 'utf8').includes('lead-secret@example.com'), true);
+    const again = await request('GET', '/meta/leads/pending', { headers: { authorization: `Bearer ${KEY}` } });
+    assert.equal(again.status, 200);
+    assert.equal(again.json[0].email, 'lead-secret@example.com');
   });
 
   test('Meta and Shopify webhooks fail closed unless their own signature matches', async () => {
