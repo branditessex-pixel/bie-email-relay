@@ -377,6 +377,52 @@ describe('public email links and webhooks', { concurrency: false }, () => {
     delete process.env.SHOPIFY_WEBHOOK_SECRET;
   });
 
+  test('a webhook secret with a trailing newline still verifies a correctly signed body', async () => {
+    const raw = JSON.stringify({ entry: [{ changes: [{ value: { leadgen_id: '1001' } }] }] });
+    const secret = 'meta-app-secret';
+    process.env.META_APP_SECRET = `${secret}\n`;
+    const good = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+    const accepted = await request('POST', '/meta/lead', {
+      body: raw,
+      contentType: 'application/json',
+      headers: { 'x-hub-signature-256': good },
+    });
+    assert.equal(accepted.status, 200);
+
+    const lines = [];
+    const original = console.warn;
+    console.warn = (...args) => { lines.push(args.map(String).join(' ')); };
+    const badSig = 'sha256=00';
+    try {
+      const rejected = await request('POST', '/meta/lead', {
+        body: raw,
+        contentType: 'application/json',
+        headers: { 'x-hub-signature-256': badSig },
+      });
+      assert.equal(rejected.status, 401);
+      const logged = lines.filter((line) => line.includes('Meta signature mismatch'));
+      assert.equal(logged.length, 1);
+      assert.match(logged[0], /header present=true, header prefix ok=true, body bytes=\d+, rawBody captured=true, secret length=15$/);
+      assert.equal(logged[0].includes(secret), false);
+      assert.equal(logged[0].includes(badSig), false);
+      assert.equal(logged[0].includes(good), false);
+    } finally {
+      console.warn = original;
+      delete process.env.META_APP_SECRET;
+    }
+
+    const shopBody = '{"id":2}';
+    process.env.SHOPIFY_WEBHOOK_SECRET = 'shopify-whsec\n';
+    const digest = crypto.createHmac('sha256', 'shopify-whsec').update(shopBody).digest('base64');
+    const shopOk = await request('POST', '/shopify/webhook/customers/update', {
+      body: shopBody,
+      contentType: 'application/json',
+      headers: { 'x-shopify-hmac-sha256': digest },
+    });
+    assert.equal(shopOk.status, 200);
+    delete process.env.SHOPIFY_WEBHOOK_SECRET;
+  });
+
   test('invalid JSON does not return a stack trace', async () => {
     const res = await request('POST', '/send', {
       body: '{',
