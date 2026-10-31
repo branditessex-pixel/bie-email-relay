@@ -402,7 +402,8 @@ describe('public email links and webhooks', { concurrency: false }, () => {
       assert.equal(rejected.status, 401);
       const logged = lines.filter((line) => line.includes('Meta signature mismatch'));
       assert.equal(logged.length, 1);
-      assert.match(logged[0], /header present=true, header prefix ok=true, body bytes=\d+, rawBody captured=true, secret length=15$/);
+      assert.match(logged[0], /header present=true, header prefix ok=true, header hex length=2, body bytes=\d+, rawBody captured=true, secrets configured=1, secrets look like app secrets=false/);
+      assert.match(logged[0], /leadgen ids=1001$/);
       assert.equal(logged[0].includes(secret), false);
       assert.equal(logged[0].includes(badSig), false);
       assert.equal(logged[0].includes(good), false);

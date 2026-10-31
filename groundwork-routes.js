@@ -19,7 +19,8 @@ const path = require('path');
 const express = require('express');
 const fetch = require('node-fetch');
 const { requireRelayKey, safeEqual } = require('./relay-auth');
-const { ingestMetaWebhook, listPendingMetaLeads, ackMetaLeads } = require('./meta-leads');
+const { ingestMetaWebhook, listPendingMetaLeads, ackMetaLeads, metaTokenStatus } = require('./meta-leads');
+const { metaAppSecrets, matchMetaSignature, signatureMismatchLog } = require('./meta-signature');
 const {
   assessLink,
   linkRejected,
@@ -315,22 +316,22 @@ function registerGroundworkRoutes(app, config) {
   // next pending read.
   app.post('/meta/lead', async (req, res) => {
     // index.js parses the JSON body and keeps the original bytes in rawBody.
-    const metaAppSecret = envSecret('META_APP_SECRET');
+    const secrets = metaAppSecrets();
     const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-    if (!metaAppSecret) {
+    if (secrets.length === 0) {
       if (!warnedMetaApp) {
         warnedMetaApp = true;
-        console.warn('[relay] META_APP_SECRET is not set; rejecting Meta lead webhooks');
+        console.warn('[relay] META_APP_SECRET / META_APP_SECRETS is not set; rejecting Meta lead webhooks');
       }
       return res.status(401).end();
     }
     const header = req.get('X-Hub-Signature-256');
-    const sig = header || '';
-    const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
-    if (!safeEqual(sig, expected)) {
-      console.warn(`[relay] Meta signature mismatch: header present=${Boolean(header)}, header prefix ok=${sig.startsWith('sha256=')}, body bytes=${raw.length}, rawBody captured=${!!req.rawBody}, secret length=${metaAppSecret.length}`);
+    const matched = matchMetaSignature(raw, header || '', secrets);
+    if (matched === -1) {
+      console.warn(signatureMismatchLog({ header, raw, rawBodyCaptured: !!req.rawBody, secrets }));
       return res.status(401).end();
     }
+    if (secrets.length > 1) console.log(`[relay] Meta signature ok with configured secret #${matched + 1} of ${secrets.length}`);
 
     let payload;
     try {
@@ -355,6 +356,18 @@ function registerGroundworkRoutes(app, config) {
       res.json(await listPendingMetaLeads());
     } catch (e) {
       console.error('[groundwork] meta lead read failed', e && e.message ? e.message : e);
+      res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // Read-only check of META_ACCESS_TOKEN via Graph /debug_token: type, app,
+  // page, expiry and scopes. The token itself is never returned or logged.
+  app.get('/meta/token-status', requireRelayKey, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+      res.json(await metaTokenStatus());
+    } catch (e) {
+      console.error('[groundwork] meta token status failed', e && e.message ? e.message : e);
       res.status(500).json({ error: 'Internal error' });
     }
   });
