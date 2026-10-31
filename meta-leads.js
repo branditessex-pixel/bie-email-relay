@@ -204,35 +204,176 @@ function applyFields(lead, fields) {
 function accessToken() {
   const value = process.env.META_ACCESS_TOKEN;
   if (typeof value !== 'string' || value.trim() === '') return '';
-  return value;
+  return value.trim();
+}
+
+const GRAPH_BASE = 'https://graph.facebook.com/v21.0';
+const STARTED_AT = Date.now();
+const DEFAULT_MAX_FETCH_ATTEMPTS = 5;
+const DEFAULT_RETRY_MINUTES = 60;
+
+function positiveNumberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function maxFetchAttempts() {
+  return Math.floor(positiveNumberEnv('META_LEAD_MAX_FETCH_ATTEMPTS', DEFAULT_MAX_FETCH_ATTEMPTS));
+}
+
+function retryAfterMs() {
+  return positiveNumberEnv('META_LEAD_RETRY_MINUTES', DEFAULT_RETRY_MINUTES) * 60 * 1000;
+}
+
+// Optional appsecret_proof, for apps with "Require App Secret" switched on.
+// Off unless META_APPSECRET_PROOF=true, because a proof made with the wrong
+// app's secret turns a working call into an error.
+function appSecretProof(token) {
+  if (String(process.env.META_APPSECRET_PROOF || '').trim().toLowerCase() !== 'true') return '';
+  const { metaAppSecrets } = require('./meta-signature');
+  const secret = metaAppSecrets()[0];
+  if (!secret) return '';
+  return crypto.createHmac('sha256', secret).update(token).digest('hex');
+}
+
+function graphUrl(pathAndQuery, token) {
+  const sep = pathAndQuery.includes('?') ? '&' : '?';
+  const proof = appSecretProof(token);
+  return `${GRAPH_BASE}${pathAndQuery}${sep}access_token=${encodeURIComponent(token)}`
+    + (proof ? `&appsecret_proof=${proof}` : '');
+}
+
+// Graph error messages do not normally carry the token, but scrub anything
+// token-shaped anyway and cap the length.
+function scrub(text) {
+  if (text == null) return null;
+  const token = accessToken();
+  let out = String(text);
+  if (token) out = out.split(token).join('[redacted]');
+  return out.replace(/EA[A-Za-z0-9]{20,}/g, '[redacted]').slice(0, 300);
+}
+
+function graphError(status, body) {
+  const err = body && body.error && typeof body.error === 'object' ? body.error : {};
+  return {
+    status: status == null ? null : status,
+    code: err.code != null ? err.code : null,
+    subcode: err.error_subcode != null ? err.error_subcode : null,
+    type: err.type != null ? String(err.type).slice(0, 60) : null,
+    message: scrub(err.message),
+    fbtraceId: err.fbtrace_id != null ? String(err.fbtrace_id).slice(0, 60) : null,
+  };
+}
+
+function describeGraphError(e) {
+  return `status=${e.status} code=${e.code} subcode=${e.subcode} type=${e.type} fbtrace_id=${e.fbtraceId} message=${JSON.stringify(e.message)}`;
 }
 
 // Never log the request URL: it carries META_ACCESS_TOKEN.
+// Resolves to { fields } on success or { error } on failure.
 async function fetchLeadFields(leadgenId) {
   const token = accessToken();
-  if (!token || !leadgenId) return null;
+  if (!token) return { error: { status: null, code: null, subcode: null, type: 'config', message: 'META_ACCESS_TOKEN is not set', fbtraceId: null } };
+  if (!leadgenId) return { error: { status: null, code: null, subcode: null, type: 'config', message: 'missing leadgen id', fbtraceId: null } };
   let response;
   try {
-    response = await graphFetch(
-      `https://graph.facebook.com/v21.0/${encodeURIComponent(leadgenId)}?fields=field_data,created_time&access_token=${encodeURIComponent(token)}`,
-      { timeout: 8000 }
-    );
-  } catch {
-    console.error('[groundwork] meta graph fetch failed');
-    return null;
+    response = await graphFetch(graphUrl(`/${encodeURIComponent(leadgenId)}?fields=field_data,created_time`, token), { timeout: 8000 });
+  } catch (e) {
+    const error = { status: null, code: null, subcode: null, type: 'network', message: scrub(e && e.message), fbtraceId: null };
+    console.error(`[groundwork] meta graph fetch failed for lead ${leadgenId}: ${describeGraphError(error)}`);
+    return { error };
   }
-  if (!response || !response.ok) {
-    console.error('[groundwork] meta graph fetch failed', response && response.status);
-    return null;
-  }
-  let data;
+  let data = null;
   try {
     data = await response.json();
   } catch {
-    console.error('[groundwork] meta graph fetch failed');
+    data = null;
+  }
+  if (!response || !response.ok) {
+    const error = graphError(response && response.status, data);
+    console.error(`[groundwork] meta graph fetch failed for lead ${leadgenId}: ${describeGraphError(error)}`);
+    return { error };
+  }
+  const fields = fieldsFromGraph(data);
+  if (!fields) {
+    const error = { status: response.status, code: null, subcode: null, type: 'empty', message: 'no field_data in response', fbtraceId: null };
+    console.error(`[groundwork] meta graph fetch failed for lead ${leadgenId}: ${describeGraphError(error)}`);
+    return { error };
+  }
+  return { fields };
+}
+
+// The first META_LEAD_MAX_FETCH_ATTEMPTS tries happen on every webhook and
+// poll. After that the lead is marked details_unavailable and tried at most
+// once per META_LEAD_RETRY_MINUTES, plus once after every restart/redeploy
+// (which is when a new token takes effect).
+function shouldTryFetch(lead, now = Date.now()) {
+  if (!lead || lead.leadgenId == null || lead.fieldsFetched) return false;
+  const attempts = Number(lead.fetchAttempts) || 0;
+  if (attempts < maxFetchAttempts()) return true;
+  const last = lead.lastFetchAttemptAt ? Date.parse(lead.lastFetchAttemptAt) : NaN;
+  if (Number.isNaN(last) || last < STARTED_AT) return true;
+  return now - last >= retryAfterMs();
+}
+
+function applyFetchFailure(lead, error) {
+  lead.fetchAttempts = (Number(lead.fetchAttempts) || 0) + 1;
+  lead.lastFetchAttemptAt = new Date().toISOString();
+  lead.lastFetchError = {
+    status: error.status,
+    code: error.code,
+    subcode: error.subcode,
+    type: error.type,
+    message: error.message,
+  };
+  if (lead.fetchAttempts >= maxFetchAttempts()) {
+    if (lead.detailsStatus !== 'details_unavailable') {
+      console.warn(`[groundwork] meta lead ${lead.leadgenId} marked details_unavailable after ${lead.fetchAttempts} failed Graph reads (page ${lead.pageId}, form ${lead.formId}); still listed in /meta/leads/pending`);
+    }
+    lead.detailsStatus = 'details_unavailable';
+  } else {
+    lead.detailsStatus = 'pending';
+  }
+}
+
+function applyFetchSuccess(lead, fields) {
+  applyFields(lead, fields);
+  lead.detailsStatus = 'fetched';
+  lead.lastFetchAttemptAt = new Date().toISOString();
+  delete lead.lastFetchError;
+}
+
+// Fetch outside the queue, then write the outcome against a fresh read.
+// Returns the stored lead after the update, or null if it is gone.
+let warnedNoToken = false;
+async function fetchAndRecord(leadgenId) {
+  // No token is a config gap, not a failed read: keep the lead raw and do
+  // not count an attempt, as before.
+  if (!accessToken()) {
+    if (!warnedNoToken) {
+      warnedNoToken = true;
+      console.warn('[groundwork] META_ACCESS_TOKEN is not set; Meta leads are stored without their fields');
+    }
     return null;
   }
-  return fieldsFromGraph(data);
+  const result = await fetchLeadFields(leadgenId);
+  return enqueue(() => {
+    const current = readStoredMetaLeads();
+    const leads = pruneLeads(current);
+    const lead = leads.find((item) => sameId(item, leadgenId));
+    if (!lead) {
+      if (leads.length !== current.length) writeStoredMetaLeads(leads);
+      return null;
+    }
+    if (!lead.fieldsFetched) {
+      if (result.fields) applyFetchSuccess(lead, result.fields);
+      else applyFetchFailure(lead, result.error);
+    }
+    writeStoredMetaLeads(leads);
+    return { ...lead };
+  });
 }
 
 async function ingestMetaWebhook(payload) {
@@ -248,7 +389,7 @@ async function ingestMetaWebhook(payload) {
       seen.add(note.leadgenId);
       const existing = leads.find((lead) => sameId(lead, note.leadgenId));
       if (existing) {
-        if (!existing.fieldsFetched) need.push(existing.leadgenId);
+        if (shouldTryFetch(existing)) need.push(existing.leadgenId);
         continue;
       }
       const lead = rawLead(note);
@@ -261,19 +402,7 @@ async function ingestMetaWebhook(payload) {
   });
 
   for (const leadgenId of toFetch) {
-    const fields = await fetchLeadFields(leadgenId);
-    if (!fields) continue;
-    await enqueue(() => {
-      const current = readStoredMetaLeads();
-      const leads = pruneLeads(current);
-      let changed = leads.length !== current.length;
-      const lead = leads.find((item) => sameId(item, leadgenId));
-      if (lead && !lead.fieldsFetched) {
-        applyFields(lead, fields);
-        changed = true;
-      }
-      if (changed) writeStoredMetaLeads(leads);
-    });
+    await fetchAndRecord(leadgenId);
   }
 }
 
@@ -285,32 +414,69 @@ async function listPendingMetaLeads() {
     return leads.map((lead) => ({ ...lead }));
   });
 
-  const enriched = [];
-  for (const lead of snapshot) {
-    if (lead.leadgenId == null || lead.fieldsFetched) continue;
-    const fields = await fetchLeadFields(lead.leadgenId);
-    if (!fields) continue;
-    applyFields(lead, fields);
-    enriched.push(String(lead.leadgenId));
+  const now = Date.now();
+  for (let i = 0; i < snapshot.length; i++) {
+    if (!accessToken()) break;
+    if (!shouldTryFetch(snapshot[i], now)) continue;
+    const updated = await fetchAndRecord(snapshot[i].leadgenId);
+    if (updated) snapshot[i] = updated;
   }
 
-  if (enriched.length === 0) return snapshot;
-
-  await enqueue(() => {
-    const current = readStoredMetaLeads();
-    const leads = pruneLeads(current);
-    let changed = leads.length !== current.length;
-    for (const leadgenId of enriched) {
-      const updated = snapshot.find((lead) => sameId(lead, leadgenId));
-      const lead = leads.find((item) => sameId(item, leadgenId));
-      if (!updated || !lead || lead.fieldsFetched) continue;
-      applyFields(lead, updated);
-      changed = true;
-    }
-    if (changed) writeStoredMetaLeads(leads);
-  });
-
   return snapshot;
+}
+
+const WANTED_SCOPES = ['leads_retrieval', 'pages_show_list', 'pages_read_engagement', 'pages_manage_metadata'];
+
+function isoFromUnix(value) {
+  if (value === 0) return 'never';
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return new Date(value * 1000).toISOString();
+}
+
+// GET /meta/token-status. Reports what Graph says about META_ACCESS_TOKEN
+// without returning the token. debug_token is called with the token itself
+// as both input and access token, which Graph allows for its own token.
+async function metaTokenStatus() {
+  const { metaAppSecrets } = require('./meta-signature');
+  const token = accessToken();
+  const base = {
+    tokenConfigured: Boolean(token),
+    appSecretsConfigured: metaAppSecrets().length,
+    appSecretProof: Boolean(token && appSecretProof(token)),
+  };
+  if (!token) return base;
+
+  let response;
+  let body = null;
+  try {
+    response = await graphFetch(graphUrl(`/debug_token?input_token=${encodeURIComponent(token)}`, token), { timeout: 8000 });
+    try { body = await response.json(); } catch { body = null; }
+  } catch (e) {
+    return { ...base, error: { status: null, type: 'network', message: scrub(e && e.message) } };
+  }
+  if (!response.ok || !body || !body.data) {
+    return { ...base, error: graphError(response.status, body) };
+  }
+  const data = body.data;
+  const scopes = Array.isArray(data.scopes) ? data.scopes.map(String) : [];
+  const granular = Array.isArray(data.granular_scopes) ? data.granular_scopes : [];
+  const leadsScope = granular.find((g) => g && g.scope === 'leads_retrieval');
+  const configuredAppId = (process.env.META_APP_ID || '').trim();
+  return {
+    ...base,
+    valid: Boolean(data.is_valid),
+    type: data.type || null,
+    appId: data.app_id != null ? String(data.app_id) : null,
+    application: data.application || null,
+    appIdMatchesMETA_APP_ID: configuredAppId ? String(data.app_id) === configuredAppId : null,
+    profileId: data.profile_id != null ? String(data.profile_id) : null,
+    expiresAt: isoFromUnix(data.expires_at),
+    dataAccessExpiresAt: isoFromUnix(data.data_access_expires_at),
+    scopes,
+    missingScopes: WANTED_SCOPES.filter((s) => !scopes.includes(s)),
+    leadsRetrievalPageIds: leadsScope && Array.isArray(leadsScope.target_ids) ? leadsScope.target_ids.map(String) : null,
+    error: data.error ? { code: data.error.code || null, subcode: data.error.subcode || null, message: scrub(data.error.message) } : null,
+  };
 }
 
 async function ackMetaLeads(ids) {
@@ -336,4 +502,6 @@ module.exports = {
   ingestMetaWebhook,
   listPendingMetaLeads,
   ackMetaLeads,
+  metaTokenStatus,
+  shouldTryFetch,
 };

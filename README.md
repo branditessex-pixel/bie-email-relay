@@ -21,7 +21,8 @@ Express also answers `HEAD` for each `GET` route with the same handler and the s
 | `GET` | `/unsubscribe` | Link signature + per-email token | Confirms unsubscribe and, when Shopify env is set, updates marketing consent. |
 | `POST` | `/unsubscribe` | Link signature + per-email token | RFC 8058 one-click unsubscribe. Same checks as `GET`. |
 | `GET` | `/meta/lead` | `META_VERIFY_TOKEN` | Meta hub challenge. The token is required; a missing token does not echo `hub.challenge`. |
-| `POST` | `/meta/lead` | `META_APP_SECRET` HMAC | Meta lead webhook. The app secret is required. The raw lead is stored, then fields are read from the Graph API with `META_ACCESS_TOKEN`. |
+| `GET` | `/meta/token-status` | `RELAY_API_KEY` | Read-only. Asks Graph `/debug_token` about `META_ACCESS_TOKEN` and returns its type, app id, page (`profileId`), expiry, scopes and `missingScopes`. Never returns the token. |
+| `POST` | `/meta/lead` | `META_APP_SECRET` / `META_APP_SECRETS` HMAC | Meta lead webhook. The app secret is required. The raw lead is stored, then fields are read from the Graph API with `META_ACCESS_TOKEN`. |
 | `POST` | `/shopify/webhook/customers/update` | `SHOPIFY_WEBHOOK_SECRET` HMAC | Checks Shopify's `X-Shopify-Hmac-Sha256` over the raw body and returns 200. |
 
 `RELAY_API_KEY` is not added to Meta or Shopify webhooks. Email pixels, click redirects, and unsubscribe links cannot send that header; they use the link signature below.
@@ -106,11 +107,13 @@ Shopify: HMAC-SHA256 of the raw body, base64, compared in constant time with `X-
 
 Meta challenge: `hub.mode=subscribe` and `hub.verify_token` must match `META_VERIFY_TOKEN` in constant time. The code reads `META_VERIFY_TOKEN`. It does not read `META_LEAD_VERIFY_TOKEN`. If the token is unset, the challenge is `403` and `hub.challenge` is not echoed.
 
-Meta lead POST: `X-Hub-Signature-256` must equal `sha256=` plus the hex HMAC-SHA256 of the raw body, keyed with `META_APP_SECRET`. If that secret is unset, the route returns `401` and does not store a lead. A valid call stores every leadgen id in the body (form, page, and time included), skipping ids already stored, then tries the Graph field read, then returns `200`. A failed or skipped Graph read still returns `200` and keeps the raw lead. The route returns `500` only when the lead file cannot be written, so Meta retries.
+Meta lead POST: `X-Hub-Signature-256` must equal `sha256=` plus the hex HMAC-SHA256 of the raw body, keyed with one of the configured app secrets: `META_APP_SECRETS` (comma-separated, for a rotation or a second app) and/or `META_APP_SECRET`. Every secret is checked in constant time. A mismatch is `401` and logs the header shape, body size, how many secrets are configured, and the unverified payload's `object`, entry (page) ids, form ids and leadgen ids, so the sending page/app can be identified. No secret or signature is logged. If no secret is set, the route returns `401` and does not store a lead. A valid call stores every leadgen id in the body (form, page, and time included), skipping ids already stored, then tries the Graph field read, then returns `200`. A failed or skipped Graph read still returns `200` and keeps the raw lead. The route returns `500` only when the lead file cannot be written, so Meta retries.
 
 ### Meta lead storage
 
 Pending leads are one JSON file, `$DATA_DIR/meta-leads.json`. Attach a Railway Volume mounted at `/data` and set `DATA_DIR=/data`. The container disk is wiped on restart and redeploy; the volume is not. When `DATA_DIR` is unset, the file stays at `./data/meta-leads.json`, which is the previous location. `META_LEADS_FILE` still names the file only when `DATA_DIR` is unset. Writes use a temp file in the same directory and then rename.
+
+Graph field reads log Meta's `error.code`, `error_subcode`, `type`, `fbtrace_id` and message on failure (never the URL or token). Each failure is recorded on the lead as `fetchAttempts`, `lastFetchAttemptAt` and `lastFetchError`. After `META_LEAD_MAX_FETCH_ATTEMPTS` (default 5) failures the lead gets `detailsStatus: "details_unavailable"`, stays listed with its `leadgenId`, `formId` and `pageId` (still `fieldsFetched: false`, so the CRM keeps it unacked), and Graph is tried at most once per `META_LEAD_RETRY_MINUTES` (default 60) plus once after each restart or redeploy. A good read sets `detailsStatus: "fetched"`. Set `META_APPSECRET_PROOF=true` only if the Meta app has "Require App Secret" switched on; the proof uses the first configured app secret.
 
 `GET /meta/leads/pending` reloads that file, retries the Graph field fetch for any lead whose fields are not stored yet, and returns the list. It does not delete leads. Each object includes `leadgenId`. Webhook fields are `formId`, `pageId`, and `createdTime`. After a successful Graph read the object also has `name`, `email`, `phone`, `company`, `need`, and `quantity`, and `fieldsFetched` is `true`.
 

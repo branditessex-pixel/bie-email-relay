@@ -209,6 +209,10 @@ describe('relay shared secret', { concurrency: false }, () => {
     assert.equal(ack.status, 401);
     assert.deepEqual(ack.json, { error: 'Unauthorized' });
 
+    const tokenStatus = await request('GET', '/meta/token-status');
+    assert.equal(tokenStatus.status, 401);
+    assert.deepEqual(tokenStatus.json, { error: 'Unauthorized' });
+
     const routes = [];
     app._router.stack.forEach((layer) => {
       if (!layer.route) return;
@@ -225,6 +229,7 @@ describe('relay shared secret', { concurrency: false }, () => {
       'GET /health',
       'GET /meta/lead',
       'GET /meta/leads/pending',
+      'GET /meta/token-status',
       'GET /track/click/:campaignId/:customerId/:url',
       'GET /track/open/:campaignId/:customerId',
       'GET /unsubscribe',
