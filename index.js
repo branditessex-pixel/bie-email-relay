@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const registerGroundworkRoutes = require('./groundwork-routes');
+const { requireRelayKey, warnIfRelayKeyMissing } = require('./relay-auth');
+const { warnIfLinkSecretMissing } = require('./link-sign');
 
 const app = express();
 app.use(cors());
@@ -9,22 +11,19 @@ app.use(cors());
 // parsed object cannot be used to check that signature.
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
+// Webhook secrets, RELAY_API_KEY, and RELAY_LINK_SECRET are read from the
+// environment on each request. Shopify consent updates use the shop values below.
 registerGroundworkRoutes(app, {
   shopifyDomain: process.env.SHOPIFY_STORE || process.env.SHOPIFY_DOMAIN,
   shopifyAdminToken: process.env.SHOPIFY_ADMIN_TOKEN,
-  shopifyWebhookSecret: process.env.SHOPIFY_WEBHOOK_SECRET,
-  unsubscribeSecret: process.env.UNSUBSCRIBE_SECRET,
-  metaLeadVerifyToken: process.env.META_VERIFY_TOKEN,
-  metaAppSecret: process.env.META_APP_SECRET,
-  metaAccessToken: process.env.META_ACCESS_TOKEN,
-  metaLeadsSecret: process.env.META_LEADS_SECRET,
 });
 
+// Public liveness check. Keep this body to { status: 'ok' } — no config or versions.
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.post('/send', async (req, res) => {
+app.post('/send', requireRelayKey, async (req, res) => {
   const { to, subject, text } = req.body;
 
   if (!to || !subject || !text) {
@@ -55,10 +54,26 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// Parser and route failures must not echo a stack or the request body.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && (err.type === 'entity.parse.failed' || err.status === 400)) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  console.error('[relay] request error', err && err.message ? err.message : err);
+  return res.status(500).json({ error: 'Internal error' });
+});
+
 // A bug in one request must never take tracking, unsubscribes and the CRM's
 // results offline, so log it and carry on instead of letting the process die.
 process.on('unhandledRejection', (e) => console.error('[relay] unhandled rejection', e));
 process.on('uncaughtException', (e) => console.error('[relay] uncaught exception', e));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
+if (require.main === module) {
+  warnIfRelayKeyMissing();
+  warnIfLinkSecretMissing();
+  app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
+}
+
+module.exports = app;

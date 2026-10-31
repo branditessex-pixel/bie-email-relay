@@ -4,30 +4,37 @@
  * the CRM polls to build its campaign history table, and a Meta Lead Gen
  * webhook that stores incoming leads for the CRM to collect.
  *
- * Event storage is a flat JSON file per campaign under DATA_DIR — Railway's
- * filesystem is ephemeral across deploys/restarts, so this is a best-effort
- * log, not a durable database. Good enough for open/click/unsubscribe counts
- * that only need to survive between sends and the next redeploy.
+ * Campaign event storage is a flat JSON file per campaign under
+ * CAMPAIGN_DATA_DIR — Railway's filesystem is ephemeral across deploys
+ * and restarts, so open/click/unsubscribe counts are best-effort between
+ * sends and the next redeploy.
  *
- * Meta leads are stored the same way under META_LEADS_FILE. The CRM polls
- * GET /meta/leads/pending to consume them; once consumed they are gone.
- * A Railway restart between a lead arriving and the CRM polling will lose
- * that lead — acceptable at current volumes. If that ever matters, swap the
- * JSON file for a Railway Postgres add-on.
+ * Meta leads are the exception. They are stored by meta-leads.js under
+ * DATA_DIR (a mounted volume) and stay there until the CRM acknowledges
+ * them. GET /meta/leads/pending does not delete. A restart reloads the file.
  */
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const fetch = require('node-fetch');
+const { requireRelayKey, safeEqual } = require('./relay-auth');
+const { ingestMetaWebhook, listPendingMetaLeads, ackMetaLeads } = require('./meta-leads');
+const {
+  assessLink,
+  linkRejected,
+  noteUnsignedLink,
+  noteRejectedLink,
+  noteClickRewritten,
+  resolveClickRedirect,
+} = require('./link-sign');
 
 const TRANSPARENT_PIXEL = Buffer.from(
   'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBTAA7',
   'base64'
 );
 
-const DATA_DIR = process.env.CAMPAIGN_DATA_DIR || path.join(__dirname, 'data', 'campaigns');
-const META_LEADS_FILE = process.env.META_LEADS_FILE || path.join(__dirname, 'data', 'meta-leads.json');
+const CAMPAIGN_DIR = process.env.CAMPAIGN_DATA_DIR || path.join(__dirname, 'data', 'campaigns');
 
 function makeToken(secret, email) {
   return crypto.createHmac('sha256', secret).update(email.trim().toLowerCase()).digest('hex');
@@ -79,7 +86,7 @@ async function updateShopifyMarketingConsent({ domain, adminToken, email, unsubs
 // ── Event log (flat JSON file per campaign) ────────────────────────────────
 function campaignFile(campaignId) {
   const safe = String(campaignId).replace(/[^a-zA-Z0-9_-]/g, '');
-  return path.join(DATA_DIR, `${safe}.json`);
+  return path.join(CAMPAIGN_DIR, `${safe}.json`);
 }
 
 function readEvents(campaignId) {
@@ -93,7 +100,7 @@ function readEvents(campaignId) {
 let writeQueue = Promise.resolve();
 function appendEvent(campaignId, event) {
   writeQueue = writeQueue.then(() => {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.mkdirSync(CAMPAIGN_DIR, { recursive: true });
     const events = readEvents(campaignId);
     events.push(event);
     fs.writeFileSync(campaignFile(campaignId), JSON.stringify(events));
@@ -101,38 +108,51 @@ function appendEvent(campaignId, event) {
   return writeQueue;
 }
 
-// ── Meta Lead Gen pending store ────────────────────────────────────────────
-let metaWriteQueue = Promise.resolve();
-
-function readMetaLeads() {
-  try { return JSON.parse(fs.readFileSync(META_LEADS_FILE, 'utf8')); } catch { return []; }
+// Secrets are read per request so a missing value fails closed even if the
+// process was started with an empty variable and so tests can exercise both.
+function envSecret(name) {
+  const value = process.env[name];
+  if (typeof value !== 'string' || value.trim() === '') return '';
+  return value;
 }
 
-function appendMetaLead(lead) {
-  metaWriteQueue = metaWriteQueue.then(() => {
-    fs.mkdirSync(path.dirname(META_LEADS_FILE), { recursive: true });
-    const leads = readMetaLeads();
-    leads.push(lead);
-    fs.writeFileSync(META_LEADS_FILE, JSON.stringify(leads));
-  }).catch((e) => console.error('[groundwork] meta lead write failed', e));
-  return metaWriteQueue;
+let warnedMetaVerify = false;
+let warnedMetaApp = false;
+let warnedShopifyWebhook = false;
+
+function rejectPublicLink(res) {
+  res.set('Cache-Control', 'no-store');
+  return res.status(403).json({ error: 'Invalid link' });
 }
 
-function flushMetaLeads() {
-  const leads = readMetaLeads();
-  fs.mkdirSync(path.dirname(META_LEADS_FILE), { recursive: true });
-  fs.writeFileSync(META_LEADS_FILE, JSON.stringify([]));
-  return leads;
+function decodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return '';
+  }
 }
 
 function registerGroundworkRoutes(app, config) {
-  const { shopifyDomain, shopifyAdminToken, shopifyWebhookSecret, unsubscribeSecret,
-          metaLeadVerifyToken, metaAppSecret, metaAccessToken, metaLeadsSecret } = config;
+  const { shopifyDomain, shopifyAdminToken } = config;
 
   async function handleUnsubscribe(req, res) {
-    const email = (req.query.email || (req.body && req.body.email) || '').toString();
-    const token = (req.query.token || (req.body && req.body.token) || '').toString();
-    const campaignId = (req.query.campaignId || (req.body && req.body.campaignId) || '').toString();
+    const link = assessLink(req);
+    const route = `${req.method} /unsubscribe`;
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      res.status(403);
+      return req.method === 'POST' ? res.end() : res.send(confirmationPage({ ok: false }));
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
+
+    // A signed link covers the query string only. Ignore body fields then, so a
+    // signed URL cannot be reused to unsubscribe a different address.
+    const body = link.status === 'signed' ? {} : (req.body || {});
+    const email = (req.query.email || body.email || '').toString();
+    const token = (req.query.token || body.token || '').toString();
+    const campaignId = (req.query.campaignId || body.campaignId || '').toString();
+    const unsubscribeSecret = envSecret('UNSUBSCRIBE_SECRET');
 
     try {
       if (!verifyToken(unsubscribeSecret, email, token)) {
@@ -159,6 +179,13 @@ function registerGroundworkRoutes(app, config) {
   app.post('/unsubscribe', express.urlencoded({ extended: false }), handleUnsubscribe);
 
   app.get('/track/open/:campaignId/:customerId', async (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /track/open/:campaignId/:customerId';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     const { campaignId, customerId } = req.params;
     appendEvent(campaignId, { type: 'open', customerId, at: new Date().toISOString() });
     res.set('Content-Type', 'image/gif');
@@ -167,29 +194,44 @@ function registerGroundworkRoutes(app, config) {
   });
 
   app.get('/track/click/:campaignId/:customerId/:url', async (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /track/click/:campaignId/:customerId/:url';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     const { campaignId, customerId, url } = req.params;
-    const destination = decodeURIComponent(url);
+    const destination = decodeParam(url);
     // ?block=... is optional and only present for links the Groundwork CRM's
     // Designed Email block editor tagged with which block produced them —
     // an ordinary link (Simple editor, or an older campaign sent before this
     // existed) just has no block query param, and this falls back to
     // `undefined` exactly as before.
     const block = req.query.block || undefined;
+    const target = resolveClickRedirect(destination, { trusted: link.status === 'signed' });
+    if (!target.toDestination) noteClickRewritten(target.host);
     await appendEvent(campaignId, { type: 'click', customerId, url: destination, block, at: new Date().toISOString() });
-    res.redirect(302, destination);
+    res.redirect(302, target.location);
   });
 
   app.post('/shopify/webhook/customers/update', async (req, res) => {
-    const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-    const digest = crypto.createHmac('sha256', shopifyWebhookSecret || '').update(raw).digest('base64');
-    if (!shopifyWebhookSecret || !hmacHeader || digest !== hmacHeader) {
+    const shopifyWebhookSecret = envSecret('SHOPIFY_WEBHOOK_SECRET');
+    if (!shopifyWebhookSecret) {
+      if (!warnedShopifyWebhook) {
+        warnedShopifyWebhook = true;
+        console.warn('[relay] SHOPIFY_WEBHOOK_SECRET is not set; rejecting Shopify customer webhooks');
+      }
       return res.status(401).end();
     }
+    const hmacHeader = req.get('X-Shopify-Hmac-Sha256') || '';
+    const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const digest = crypto.createHmac('sha256', shopifyWebhookSecret).update(raw).digest('base64');
+    if (!hmacHeader || !safeEqual(hmacHeader, digest)) return res.status(401).end();
     res.status(200).end();
   });
 
-  app.get('/campaigns/:campaignId/stats', (req, res) => {
+  app.get('/campaigns/:campaignId/stats', requireRelayKey, (req, res) => {
     const events = readEvents(req.params.campaignId);
     const uniqueBy = (type) => new Set(events.filter((e) => e.type === type).map((e) => e.customerId)).size;
     res.json({
@@ -207,6 +249,13 @@ function registerGroundworkRoutes(app, config) {
   // "abandoned_<checkout token>" id instead of a campaignId, so one cart's
   // events never collide with a real campaign's.
   app.get('/abandoned/track/open/:token', (req, res) => {
+    const link = assessLink(req);
+    const route = 'GET /abandoned/track/open/:token';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
     appendEvent(`abandoned_${req.params.token}`, { type: 'open', at: new Date().toISOString() });
     res.set('Content-Type', 'image/gif');
     res.set('Cache-Control', 'no-store');
@@ -214,15 +263,24 @@ function registerGroundworkRoutes(app, config) {
   });
 
   app.get('/abandoned/track/click/:token/:link/:url', async (req, res) => {
-    const { token, link, url } = req.params;
-    const destination = decodeURIComponent(url);
-    await appendEvent(`abandoned_${token}`, { type: 'click', link, url: destination, at: new Date().toISOString() });
-    res.redirect(302, destination);
+    const link = assessLink(req);
+    const route = 'GET /abandoned/track/click/:token/:link/:url';
+    if (linkRejected(link.status)) {
+      noteRejectedLink(link.status, route);
+      return rejectPublicLink(res);
+    }
+    if (link.status === 'unsigned') noteUnsignedLink(route);
+    const { token, link: linkName, url } = req.params;
+    const destination = decodeParam(url);
+    const target = resolveClickRedirect(destination, { trusted: link.status === 'signed' });
+    if (!target.toDestination) noteClickRewritten(target.host);
+    await appendEvent(`abandoned_${token}`, { type: 'click', link: linkName, url: destination, at: new Date().toISOString() });
+    res.redirect(302, target.location);
   });
 
   // Bulk read so the CRM can refresh every tracked cart's opens/clicks in one
   // request per check instead of one per cart.
-  app.get('/abandoned/stats', (req, res) => {
+  app.get('/abandoned/stats', requireRelayKey, (req, res) => {
     const tokens = String(req.query.tokens || '').split(',').map((t) => t.trim()).filter(Boolean);
     const out = {};
     tokens.forEach((token) => { out[token] = readEvents(`abandoned_${token}`); });
@@ -233,64 +291,81 @@ function registerGroundworkRoutes(app, config) {
   // Step 1: Meta verifies the endpoint with a GET challenge when you first
   // register the webhook in the Meta App dashboard.
   app.get('/meta/lead', (req, res) => {
-    if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === metaLeadVerifyToken) {
-      return res.status(200).send(req.query['hub.challenge']);
+    const metaLeadVerifyToken = envSecret('META_VERIFY_TOKEN');
+    const provided = req.query['hub.verify_token'];
+    if (!metaLeadVerifyToken) {
+      if (!warnedMetaVerify) {
+        warnedMetaVerify = true;
+        console.warn('[relay] META_VERIFY_TOKEN is not set; rejecting Meta webhook verification challenges');
+      }
+      return res.status(403).end();
     }
-    res.status(403).end();
+    if (req.query['hub.mode'] !== 'subscribe' || typeof provided !== 'string' || !safeEqual(provided, metaLeadVerifyToken)) {
+      return res.status(403).end();
+    }
+    const challenge = req.query['hub.challenge'];
+    if (typeof challenge !== 'string') return res.status(403).end();
+    return res.status(200).send(challenge);
   });
 
   // Step 2: Meta POSTs a notification when a lead submits the form.
-  // We verify the signature, fetch the actual field data from the Graph API,
-  // and store it for the CRM to collect.
+  // The signature is required. The raw leadgen id, form, page, and time are
+  // stored before we answer, even when the Graph field fetch fails. A duplicate
+  // leadgen id is not stored twice. Field data is filled in here or on the
+  // next pending read.
   app.post('/meta/lead', async (req, res) => {
     // index.js parses the JSON body and keeps the original bytes in rawBody.
+    const metaAppSecret = envSecret('META_APP_SECRET');
     const raw = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-    if (metaAppSecret) {
-      const sig = req.get('X-Hub-Signature-256') || '';
-      const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
-      const a = Buffer.from(sig); const b = Buffer.from(expected);
-      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).end();
+    if (!metaAppSecret) {
+      if (!warnedMetaApp) {
+        warnedMetaApp = true;
+        console.warn('[relay] META_APP_SECRET is not set; rejecting Meta lead webhooks');
+      }
+      return res.status(401).end();
     }
-    res.status(200).end();
+    const sig = req.get('X-Hub-Signature-256') || '';
+    const expected = 'sha256=' + crypto.createHmac('sha256', metaAppSecret).update(raw).digest('hex');
+    if (!safeEqual(sig, expected)) return res.status(401).end();
 
+    let payload;
     try {
-      const payload = req.body && typeof req.body === 'object' ? req.body : JSON.parse(raw.toString());
-      const change = (payload.entry && payload.entry[0] && payload.entry[0].changes && payload.entry[0].changes[0]) || {};
-      const leadgenId = change.value && change.value.leadgen_id;
-      if (!leadgenId || !metaAccessToken) return;
-
-      const r = await fetch(
-        `https://graph.facebook.com/v21.0/${leadgenId}?fields=field_data,created_time&access_token=${metaAccessToken}`
-      );
-      if (!r.ok) { console.error('[groundwork] meta graph fetch failed', r.status); return; }
-      const data = await r.json();
-
-      const fields = {};
-      for (const f of (data.field_data || [])) fields[f.name] = (f.values && f.values[0]) || '';
-
-      const lead = {
-        leadgenId,
-        receivedAt: new Date().toISOString(),
-        name: fields.full_name || [fields.first_name, fields.last_name].filter(Boolean).join(' ').trim() || null,
-        email: fields.email || null,
-        phone: fields.phone_number || fields.phone || null,
-        company: fields.company_name || fields.business_name || null,
-        need: fields.what_are_you_looking_for || fields.workwear_type || null,
-        quantity: fields.how_many_staff || fields.quantity || null,
-      };
-
-      await appendMetaLead(lead);
+      payload = req.body && typeof req.body === 'object' ? req.body : JSON.parse(raw.toString());
+    } catch {
+      return res.status(400).end();
+    }
+    try {
+      await ingestMetaWebhook(payload);
     } catch (e) {
-      console.error('[groundwork] meta lead processing failed', e);
+      console.error('[groundwork] meta lead write failed', e && e.message ? e.message : e);
+      return res.status(500).end();
+    }
+    return res.status(200).end();
+  });
+
+  // Step 3: The CRM polls this endpoint. Leads stay on disk until it acks
+  // the leadgen ids it has stored. Older app versions never ack, so the
+  // same leads are returned again; the app de-dupes by leadgenId.
+  app.get('/meta/leads/pending', requireRelayKey, async (req, res) => {
+    try {
+      res.json(await listPendingMetaLeads());
+    } catch (e) {
+      console.error('[groundwork] meta lead read failed', e && e.message ? e.message : e);
+      res.status(500).json({ error: 'Internal error' });
     }
   });
 
-  // Step 3: The CRM polls this endpoint every 10 minutes, consumes pending
-  // leads, and injects them into the local leads store.
-  app.get('/meta/leads/pending', (req, res) => {
-    const secret = metaLeadsSecret || metaLeadVerifyToken;
-    if (!secret || req.query.secret !== secret) return res.status(401).end();
-    res.json(flushMetaLeads());
+  app.post('/meta/leads/ack', requireRelayKey, async (req, res) => {
+    const ids = req.body && req.body.leadgenIds;
+    if (!Array.isArray(ids)) {
+      return res.status(400).json({ error: 'leadgenIds must be an array' });
+    }
+    try {
+      res.json(await ackMetaLeads(ids));
+    } catch (e) {
+      console.error('[groundwork] meta lead ack failed', e && e.message ? e.message : e);
+      res.status(500).json({ error: 'Internal error' });
+    }
   });
 }
 
