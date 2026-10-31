@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const registerGroundworkRoutes = require('./groundwork-routes');
+const { requireRelayKey, warnIfRelayKeyMissing } = require('./relay-auth');
 
 const app = express();
 app.use(cors());
@@ -24,7 +25,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.post('/send', async (req, res) => {
+app.post('/send', requireRelayKey, async (req, res) => {
   const { to, subject, text } = req.body;
 
   if (!to || !subject || !text) {
@@ -61,4 +62,9 @@ process.on('unhandledRejection', (e) => console.error('[relay] unhandled rejecti
 process.on('uncaughtException', (e) => console.error('[relay] uncaught exception', e));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
+if (require.main === module) {
+  warnIfRelayKeyMissing();
+  app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
+}
+
+module.exports = app;

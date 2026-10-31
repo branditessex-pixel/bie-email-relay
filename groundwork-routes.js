@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const fetch = require('node-fetch');
+const { requireRelayKey } = require('./relay-auth');
 
 const TRANSPARENT_PIXEL = Buffer.from(
   'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBTAA7',
@@ -189,7 +190,7 @@ function registerGroundworkRoutes(app, config) {
     res.status(200).end();
   });
 
-  app.get('/campaigns/:campaignId/stats', (req, res) => {
+  app.get('/campaigns/:campaignId/stats', requireRelayKey, (req, res) => {
     const events = readEvents(req.params.campaignId);
     const uniqueBy = (type) => new Set(events.filter((e) => e.type === type).map((e) => e.customerId)).size;
     res.json({
