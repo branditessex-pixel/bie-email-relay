@@ -12,14 +12,15 @@
  * Meta leads are the exception. They are stored by meta-leads.js under
  * DATA_DIR (a mounted volume) and stay there until the CRM acknowledges
  * them. GET /meta/leads/pending does not delete. A restart reloads the file.
+ * B.I.B website-chat leads are pushed into that same queue.
  */
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const fetch = require('node-fetch');
-const { requireRelayKey, safeEqual } = require('./relay-auth');
-const { ingestMetaWebhook, listPendingMetaLeads, ackMetaLeads, metaTokenStatus } = require('./meta-leads');
+const { requireRelayKey, requireBibKey, safeEqual } = require('./relay-auth');
+const { ingestMetaWebhook, ingestBibLead, listPendingMetaLeads, ackMetaLeads, metaTokenStatus } = require('./meta-leads');
 const { metaAppSecrets, matchMetaSignature, signatureMismatchLog } = require('./meta-signature');
 const {
   assessLink,
@@ -369,6 +370,20 @@ function registerGroundworkRoutes(app, config) {
     } catch (e) {
       console.error('[groundwork] meta token status failed', e && e.message ? e.message : e);
       res.status(500).json({ error: 'Internal error' });
+    }
+  });
+
+  // B.I.B website chat. Signed with BIB_LEAD_SECRET, not RELAY_API_KEY.
+  // A new lead is 201. An id already stored, or already acked, is 200.
+  app.post('/bib/lead', requireBibKey, async (req, res) => {
+    try {
+      const result = await ingestBibLead(req.body);
+      if (result.duplicate) return res.status(200).json({ ok: true, duplicate: true });
+      return res.status(201).json({ ok: true });
+    } catch (e) {
+      if (e && e.statusCode === 400) return res.status(400).json({ error: e.message });
+      console.error('[groundwork] bib lead write failed', e && e.message ? e.message : e);
+      return res.status(500).json({ error: 'Internal error' });
     }
   });
 

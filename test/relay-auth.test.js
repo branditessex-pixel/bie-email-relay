@@ -233,6 +233,7 @@ describe('relay shared secret', { concurrency: false }, () => {
       'GET /track/click/:campaignId/:customerId/:url',
       'GET /track/open/:campaignId/:customerId',
       'GET /unsubscribe',
+      'POST /bib/lead',
       'POST /meta/lead',
       'POST /meta/leads/ack',
       'POST /send',

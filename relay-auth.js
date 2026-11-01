@@ -48,9 +48,48 @@ function requireRelayKey(req, res, next) {
   return next();
 }
 
+// B.I.B website leads. This is not the CRM key: RELAY_API_KEY also unlocks
+// POST /send, so a leaked relay key must not be enough to insert leads.
+// Callers send X-Bib-Signature: sha256=<hex HMAC-SHA256 of the raw body>.
+const MISSING_BIB_SECRET_WARNING =
+  '[relay] BIB_LEAD_SECRET is not set; refusing POST /bib/lead until it is configured';
+
+let warnedMissingBibSecret = false;
+
+function bibLeadSecret() {
+  const value = process.env.BIB_LEAD_SECRET;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text === '' ? null : text;
+}
+
+function warnIfBibSecretMissing() {
+  if (warnedMissingBibSecret || bibLeadSecret()) return;
+  warnedMissingBibSecret = true;
+  console.warn(MISSING_BIB_SECRET_WARNING);
+}
+
+function requireBibKey(req, res, next) {
+  const secret = bibLeadSecret();
+  if (!secret) {
+    warnIfBibSecretMissing();
+    return res.status(503).json({ error: 'Unavailable' });
+  }
+  const header = (req.get('x-bib-signature') || '').trim().toLowerCase();
+  const raw = req.rawBody || Buffer.alloc(0);
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+  if (!safeEqual(header, expected)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  return next();
+}
+
 module.exports = {
   requireRelayKey,
+  requireBibKey,
   warnIfRelayKeyMissing,
+  warnIfBibSecretMissing,
   MISSING_KEY_WARNING,
+  MISSING_BIB_SECRET_WARNING,
   safeEqual,
 };

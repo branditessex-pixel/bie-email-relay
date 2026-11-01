@@ -12,6 +12,12 @@
  * POST /meta/leads/ack removes only the leadgen ids it is given. Anything
  * still unacked is returned again on the next poll. Leads older than
  * META_LEADS_RETENTION_DAYS (default 30) are dropped on read and write.
+ *
+ * B.I.B website leads use the same file and queue. They arrive with their
+ * fields already filled in (source "bib") and are never read from Graph.
+ * Acknowledged B.I.B ids are remembered in acked-bib-ids.json beside the
+ * leads file, for the same retention window, so a retry after ack does
+ * not create the lead again.
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -84,15 +90,13 @@ function readStoredMetaLeads() {
   return parsed;
 }
 
-function writeStoredMetaLeads(leads) {
-  const file = metaLeadsFilePath();
+function writeJsonAtomic(file, payload) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(
     dir,
     `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
   );
-  const payload = JSON.stringify(leads);
   let fd;
   try {
     fd = fs.openSync(tmp, 'w', 0o600);
@@ -113,6 +117,63 @@ function writeStoredMetaLeads(leads) {
   } catch {
     // Some filesystems cannot fsync a directory. The rename has already landed.
   }
+}
+
+function writeStoredMetaLeads(leads) {
+  writeJsonAtomic(metaLeadsFilePath(), JSON.stringify(leads));
+}
+
+function ackedBibFilePath() {
+  return path.join(path.dirname(metaLeadsFilePath()), 'acked-bib-ids.json');
+}
+
+function readAckedBibIds() {
+  const file = ackedBibFilePath();
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return {};
+    throw err;
+  }
+  if (text.trim() === '') return {};
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const error = new Error('acked bib ids file is not a JSON object');
+    error.code = 'ACKED_BIB_CORRUPT';
+    throw error;
+  }
+  return parsed;
+}
+
+function pruneAckedBib(map, now = Date.now()) {
+  const out = Object.create(null);
+  if (!map || typeof map !== 'object') return out;
+  const maxAge = retentionMs();
+  for (const id of Object.keys(map)) {
+    if (!id || id === '__proto__' || id === 'constructor' || id === 'prototype') continue;
+    const at = map[id];
+    if (typeof at === 'string') {
+      const ms = Date.parse(at);
+      if (!Number.isNaN(ms) && now - ms > maxAge) continue;
+    }
+    out[id] = at;
+  }
+  return out;
+}
+
+function ackedMapChanged(raw, pruned) {
+  const rawKeys = raw && typeof raw === 'object' ? Object.keys(raw) : [];
+  const prunedKeys = Object.keys(pruned);
+  if (rawKeys.length !== prunedKeys.length) return true;
+  for (const key of prunedKeys) {
+    if (raw[key] !== pruned[key]) return true;
+  }
+  return false;
+}
+
+function writeAckedBibIds(map) {
+  writeJsonAtomic(ackedBibFilePath(), JSON.stringify(map));
 }
 
 function enqueue(work) {
@@ -310,7 +371,11 @@ async function fetchLeadFields(leadgenId) {
 // once per META_LEAD_RETRY_MINUTES, plus once after every restart/redeploy
 // (which is when a new token takes effect).
 function shouldTryFetch(lead, now = Date.now()) {
-  if (!lead || lead.leadgenId == null || lead.fieldsFetched) return false;
+  if (!lead || lead.leadgenId == null) return false;
+  // B.I.B leads already carry their fields. Never ask Graph for them, even
+  // when fieldsFetched was cleared.
+  if (lead.source === 'bib') return false;
+  if (lead.fieldsFetched) return false;
   const attempts = Number(lead.fetchAttempts) || 0;
   if (attempts < maxFetchAttempts()) return true;
   const last = lead.lastFetchAttemptAt ? Date.parse(lead.lastFetchAttemptAt) : NaN;
@@ -479,6 +544,154 @@ async function metaTokenStatus() {
   };
 }
 
+function isBibLead(lead) {
+  if (!lead || lead.leadgenId == null) return false;
+  if (lead.source === 'bib') return true;
+  return String(lead.leadgenId).startsWith('bib:');
+}
+
+function rememberAckedBib(leads) {
+  const acked = pruneAckedBib(readAckedBibIds());
+  const now = new Date().toISOString();
+  for (const lead of leads) acked[String(lead.leadgenId)] = now;
+  writeAckedBibIds(acked);
+}
+
+const BIB_SHORT_MAX = 200;
+const BIB_SUMMARY_MAX = 2000;
+const BIB_URL_MAX = 500;
+const BIB_UTM_KEYS_MAX = 20;
+
+function cleanText(value) {
+  return String(value).replace(/[\u0000-\u001F\u007F]/g, '').trim();
+}
+
+function clip(value, max) {
+  const text = cleanText(value);
+  if (!text) return '';
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+function toBibLeadgenId(value) {
+  let raw = null;
+  if (typeof value === 'number' && Number.isFinite(value)) raw = String(value);
+  else if (typeof value === 'string') raw = value;
+  if (raw == null) return null;
+  const text = clip(raw, BIB_SHORT_MAX);
+  if (!text) return null;
+  if (text.startsWith('bib:')) return text;
+  return 'bib:' + text;
+}
+
+function shortField(value, max) {
+  if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
+  if (typeof value !== 'string') return null;
+  const text = clip(value, max);
+  return text === '' ? null : text;
+}
+
+function normaliseEmail(value) {
+  if (typeof value !== 'string') return null;
+  const text = cleanText(value).toLowerCase();
+  if (!text || text.length > BIB_SHORT_MAX) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) return null;
+  return text;
+}
+
+function boolOrNull(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function shortOrNumber(value, max) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  return shortField(value, max);
+}
+
+function sanitiseUtm(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
+  if (typeof value === 'string') return shortField(value, BIB_SHORT_MAX);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const out = Object.create(null);
+  const keys = Object.keys(value).slice(0, BIB_UTM_KEYS_MAX);
+  for (const key of keys) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    const name = clip(key, BIB_SHORT_MAX);
+    if (!name) continue;
+    const item = value[key];
+    const text = typeof item === 'number' && Number.isFinite(item)
+      ? clip(String(item), BIB_SHORT_MAX)
+      : (typeof item === 'string' ? clip(item, BIB_SHORT_MAX) : '');
+    if (text) out[name] = text;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function sanitiseExtra(extra) {
+  const source = extra && typeof extra === 'object' && !Array.isArray(extra) ? extra : {};
+  return {
+    staffCount: shortOrNumber(source.staffCount, BIB_SHORT_MAX),
+    logoReady: boolOrNull(source.logoReady),
+    deadline: shortField(source.deadline, BIB_SHORT_MAX),
+    pageUrl: shortField(source.pageUrl, BIB_URL_MAX),
+    utm: sanitiseUtm(source.utm),
+    transcriptUrl: shortField(source.transcriptUrl, BIB_URL_MAX),
+    leadScore: shortOrNumber(source.leadScore, BIB_SHORT_MAX),
+    consent: boolOrNull(source.consent),
+  };
+}
+
+function invalidBib(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+
+function bibRecord(input, leadgenId, email) {
+  const now = new Date().toISOString();
+  return {
+    leadgenId,
+    source: 'bib',
+    fieldsFetched: true,
+    detailsStatus: 'fetched',
+    receivedAt: now,
+    createdTime: now,
+    name: shortField(input && input.name, BIB_SHORT_MAX),
+    email,
+    phone: shortField(input && input.phone, BIB_SHORT_MAX),
+    company: shortField(input && input.company, BIB_SHORT_MAX),
+    need: shortField(input && input.need, BIB_SHORT_MAX),
+    quantity: shortField(input && input.quantity, BIB_SHORT_MAX),
+    summary: shortField(input && input.summary, BIB_SUMMARY_MAX),
+    extra: sanitiseExtra(input && input.extra),
+  };
+}
+
+function storeBibLead(record) {
+  const current = readStoredMetaLeads();
+  const leads = pruneLeads(current);
+  const ackedRaw = readAckedBibIds();
+  const acked = pruneAckedBib(ackedRaw);
+  if (ackedMapChanged(ackedRaw, acked)) writeAckedBibIds(acked);
+  const known = leads.some((lead) => sameId(lead, record.leadgenId)) || Object.prototype.hasOwnProperty.call(acked, record.leadgenId);
+  if (known) {
+    if (leads.length !== current.length) writeStoredMetaLeads(leads);
+    return { duplicate: true };
+  }
+  leads.push(record);
+  writeStoredMetaLeads(leads);
+  return { duplicate: false };
+}
+
+async function ingestBibLead(input) {
+  const body = input && typeof input === 'object' ? input : {};
+  const leadgenId = toBibLeadgenId(body.id);
+  if (!leadgenId) throw invalidBib('id is required');
+  const email = normaliseEmail(body.email);
+  if (!email) throw invalidBib('email is invalid');
+  const record = bibRecord(body, leadgenId, email);
+  return enqueue(() => storeBibLead(record));
+}
+
 async function ackMetaLeads(ids) {
   const wanted = new Set();
   for (const id of ids) {
@@ -488,10 +701,14 @@ async function ackMetaLeads(ids) {
   return enqueue(() => {
     const current = readStoredMetaLeads();
     const pruned = pruneLeads(current);
+    const removedLeads = current.filter((lead) => lead.leadgenId != null && wanted.has(String(lead.leadgenId)));
     const kept = pruned.filter((lead) => lead.leadgenId == null || !wanted.has(String(lead.leadgenId)));
-    const removed = current.filter((lead) => lead.leadgenId != null && wanted.has(String(lead.leadgenId))).length;
+    const bibRemoved = removedLeads.filter(isBibLead);
+    // Remember the id before deleting the lead. A crash in between leaves
+    // the lead on disk, so the next ack can finish and a retry stays a duplicate.
+    if (bibRemoved.length) rememberAckedBib(bibRemoved);
     if (kept.length !== current.length) writeStoredMetaLeads(kept);
-    return { removed };
+    return { removed: removedLeads.length };
   });
 }
 
@@ -500,6 +717,7 @@ module.exports = {
   metaLeadsFilePath,
   readStoredMetaLeads,
   ingestMetaWebhook,
+  ingestBibLead,
   listPendingMetaLeads,
   ackMetaLeads,
   metaTokenStatus,
