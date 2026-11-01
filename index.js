@@ -2,13 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const registerGroundworkRoutes = require('./groundwork-routes');
-const { requireRelayKey, warnIfRelayKeyMissing } = require('./relay-auth');
+const { requireRelayKey, warnIfRelayKeyMissing, warnIfBibSecretMissing } = require('./relay-auth');
 const { warnIfLinkSecretMissing } = require('./link-sign');
 
 const app = express();
 app.use(cors());
-// Keep the exact bytes of every JSON body: Meta signs the raw payload, and the
-// parsed object cannot be used to check that signature.
+// Keep the exact bytes of every JSON body: Meta and B.I.B sign the raw payload,
+// and the parsed object cannot be used to check that signature.
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // Webhook secrets, RELAY_API_KEY, and RELAY_LINK_SECRET are read from the
@@ -73,6 +73,7 @@ const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   warnIfRelayKeyMissing();
   warnIfLinkSecretMissing();
+  warnIfBibSecretMissing();
   app.listen(PORT, () => console.log(`bie-email-relay listening on port ${PORT}`));
 }
 

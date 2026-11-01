@@ -23,9 +23,10 @@ Express also answers `HEAD` for each `GET` route with the same handler and the s
 | `GET` | `/meta/lead` | `META_VERIFY_TOKEN` | Meta hub challenge. The token is required; a missing token does not echo `hub.challenge`. |
 | `GET` | `/meta/token-status` | `RELAY_API_KEY` | Read-only. Asks Graph `/debug_token` about `META_ACCESS_TOKEN` and returns its type, app id, page (`profileId`), expiry, scopes and `missingScopes`. Never returns the token. |
 | `POST` | `/meta/lead` | `META_APP_SECRET` / `META_APP_SECRETS` HMAC | Meta lead webhook. The app secret is required. The raw lead is stored, then fields are read from the Graph API with `META_ACCESS_TOKEN`. |
+| `POST` | `/bib/lead` | `BIB_LEAD_SECRET` HMAC | B.I.B website-chat lead. Stored in the same pending queue as Meta leads. `RELAY_API_KEY` is not accepted. |
 | `POST` | `/shopify/webhook/customers/update` | `SHOPIFY_WEBHOOK_SECRET` HMAC | Checks Shopify's `X-Shopify-Hmac-Sha256` over the raw body and returns 200. |
 
-`RELAY_API_KEY` is not added to Meta or Shopify webhooks. Email pixels, click redirects, and unsubscribe links cannot send that header; they use the link signature below.
+`RELAY_API_KEY` is not added to Meta, B.I.B, or Shopify webhooks. Email pixels, click redirects, and unsubscribe links cannot send that header; they use the link signature below.
 
 ### `RELAY_API_KEY`
 
@@ -115,11 +116,86 @@ Pending leads are one JSON file, `$DATA_DIR/meta-leads.json`. Attach a Railway V
 
 Graph field reads log Meta's `error.code`, `error_subcode`, `type`, `fbtrace_id` and message on failure (never the URL or token). Each failure is recorded on the lead as `fetchAttempts`, `lastFetchAttemptAt` and `lastFetchError`. After `META_LEAD_MAX_FETCH_ATTEMPTS` (default 5) failures the lead gets `detailsStatus: "details_unavailable"`, stays listed with its `leadgenId`, `formId` and `pageId` (still `fieldsFetched: false`, so the CRM keeps it unacked), and Graph is tried at most once per `META_LEAD_RETRY_MINUTES` (default 60) plus once after each restart or redeploy. A good read sets `detailsStatus: "fetched"`. Set `META_APPSECRET_PROOF=true` only if the Meta app has "Require App Secret" switched on; the proof uses the first configured app secret.
 
-`GET /meta/leads/pending` reloads that file, retries the Graph field fetch for any lead whose fields are not stored yet, and returns the list. It does not delete leads. Each object includes `leadgenId`. Webhook fields are `formId`, `pageId`, and `createdTime`. After a successful Graph read the object also has `name`, `email`, `phone`, `company`, `need`, and `quantity`, and `fieldsFetched` is `true`.
+`GET /meta/leads/pending` reloads that file, retries the Graph field fetch for any Meta lead whose fields are not stored yet, and returns the list. It does not delete leads. Each object includes `leadgenId`. Webhook fields are `formId`, `pageId`, and `createdTime`. After a successful Graph read the object also has `name`, `email`, `phone`, `company`, `need`, and `quantity`, and `fieldsFetched` is `true`. Leads with `source: "bib"` are returned with the fields B.I.B already sent (`summary` and `extra` included) and are not sent to Graph.
 
 `POST /meta/leads/ack` takes `{ "leadgenIds": ["123"] }` and removes only those ids. The check is the same `RELAY_API_KEY` header as pending (`X-Relay-Key`, or `Authorization: Bearer`). Unknown ids are ignored. Ack a lead after the CRM has stored it. Leave `fieldsFetched: false` unacked so the next poll can deliver the fields. Older app versions never ack: those leads are sent again on every poll, and the app de-dupes by `leadgenId`.
 
 Leads older than `META_LEADS_RETENTION_DAYS` (default 30, measured from `receivedAt`) are removed on read and on write so the file cannot grow forever. The hub verification token is read from `META_VERIFY_TOKEN`.
+
+### B.I.B website leads
+
+`POST /bib/lead` takes a lead from the B.I.B website chatbot and stores it in the same pending file the CRM already polls. The CRM acks it with `POST /meta/leads/ack` like any other lead. `RELAY_API_KEY` does not authorise this route.
+
+Set `BIB_LEAD_SECRET` in the environment. The value is trimmed. Do not put the value in git. Send the header:
+
+`X-Bib-Signature: sha256=<hex HMAC-SHA256 of the raw request body>`
+
+The hex is lowercase. The signature covers the exact bytes of the body, not a re-serialised object. Comparison is constant-time. A missing or wrong signature is `401`. If `BIB_LEAD_SECRET` is unset, empty, or only whitespace, the route returns `503` and the process logs a warning once.
+
+Body:
+
+```json
+{
+  "id": "bib:42",
+  "name": "Ada Lovelace",
+  "email": "ada@example.com",
+  "phone": "07000900000",
+  "company": "Analytical Engines",
+  "need": "Staff polos",
+  "quantity": "12",
+  "summary": "Needs embroidered polos before Friday.",
+  "extra": {
+    "staffCount": 12,
+    "logoReady": false,
+    "deadline": "Friday",
+    "pageUrl": "https://branditessex.com/pages/workwear",
+    "utm": { "source": "chat" },
+    "transcriptUrl": "https://branditessex.com/bib/transcripts/42",
+    "leadScore": 0.8,
+    "consent": true
+  }
+}
+```
+
+`id` is required. `email` is required and must look like an email; it is stored lowercased. The stored `leadgenId` is `id` when it already starts with `bib:`, otherwise `bib:` plus `id` (`42` and `bib:42` are the same lead). Strings are trimmed, control characters are removed, and lengths are capped (200 for short fields, 2000 for `summary`, 500 for URLs). `extra` keeps only the keys above. `utm` may be a short string or an object of short strings. `logoReady` and `consent` are booleans.
+
+A new lead is `201` and `{ "ok": true }`. The same id again, including a retry after the CRM has acked it, is `200` and `{ "ok": true, "duplicate": true }` and does not create a second row. Acked B.I.B ids are kept in `acked-bib-ids.json` next to `meta-leads.json` and dropped with the same retention window. A missing or invalid `id` or `email` is `400` and nothing is stored.
+
+```javascript
+const crypto = require('crypto');
+
+function bibSignature(rawBody, secret) {
+  return 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+}
+
+const raw = JSON.stringify({
+  id: 'bib:42',
+  name: 'Ada Lovelace',
+  email: 'ada@example.com',
+  phone: '07000900000',
+  company: 'Analytical Engines',
+  need: 'Staff polos',
+  quantity: '12',
+  summary: 'Needs embroidered polos before Friday.',
+  extra: {
+    staffCount: 12,
+    logoReady: false,
+    deadline: 'Friday',
+    pageUrl: 'https://branditessex.com/pages/workwear',
+    utm: { source: 'chat' },
+    transcriptUrl: 'https://branditessex.com/bib/transcripts/42',
+    leadScore: 0.8,
+    consent: true,
+  },
+});
+
+const headers = {
+  'content-type': 'application/json',
+  'x-bib-signature': bibSignature(raw, process.env.BIB_LEAD_SECRET),
+};
+```
+
+Send `raw` as the body. Sign that string, not `JSON.stringify` of a parsed copy.
 
 ## Environment
 
@@ -139,6 +215,7 @@ Set these on the Railway service. Do not put the values in git.
 | `SHOPIFY_WEBHOOK_SECRET` | Yes, for the webhook | Shopify customer-webhook HMAC. Unset means `401`. |
 | `META_VERIFY_TOKEN` | Yes, for the challenge | Meta `hub.verify_token`. The relay reads `META_VERIFY_TOKEN`, not `META_LEAD_VERIFY_TOKEN`. |
 | `META_APP_SECRET` | Yes, for lead posts | Meta `X-Hub-Signature-256`. Unset means `401`. |
+| `BIB_LEAD_SECRET` | Yes, for B.I.B leads | HMAC key for `POST /bib/lead`. Header `X-Bib-Signature: sha256=<hex of the raw body>`. Unset means `503`. `RELAY_API_KEY` is not accepted on this route. |
 | `META_ACCESS_TOKEN` | Yes, to fill lead fields | Graph API token. A verified webhook is still stored when this is missing or the Graph read fails. Fields are retried on the next pending read. |
 | `DATA_DIR` | Yes, so leads survive restarts | Directory for `meta-leads.json`. Attach a Railway Volume mounted at `/data` and set `DATA_DIR=/data`. When unset, the file stays at `./data/meta-leads.json`. |
 | `META_LEADS_RETENTION_DAYS` | No | Drop unacked leads older than this many days. Default 30. |
