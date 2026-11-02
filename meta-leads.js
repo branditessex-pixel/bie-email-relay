@@ -561,6 +561,9 @@ const BIB_SHORT_MAX = 200;
 const BIB_SUMMARY_MAX = 2000;
 const BIB_URL_MAX = 500;
 const BIB_UTM_KEYS_MAX = 20;
+const BIB_TRANSCRIPT_MESSAGES_MAX = 200;
+const BIB_TRANSCRIPT_MESSAGE_MAX = 1000;
+const BIB_TRANSCRIPT_STRING_MAX = 20000;
 
 function cleanText(value) {
   return String(value).replace(/[\u0000-\u001F\u007F]/g, '').trim();
@@ -626,9 +629,37 @@ function sanitiseUtm(value) {
   return Object.keys(out).length ? out : null;
 }
 
+// The chat itself: a list of { from, text } (also accepts role/sender and message/content), or one plain string.
+// Returns null when there is nothing usable. Keeps the newest messages if there are too many.
+function sanitiseTranscript(value) {
+  if (typeof value === 'string') {
+    const text = clip(value, BIB_TRANSCRIPT_STRING_MAX);
+    return text ? [{ from: '', text }] : null;
+  }
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const item of value.slice(-BIB_TRANSCRIPT_MESSAGES_MAX)) {
+    if (typeof item === 'string') {
+      const text = clip(item, BIB_TRANSCRIPT_MESSAGE_MAX);
+      if (text) out.push({ from: '', text });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const raw = [item.text, item.message, item.content].find((v) => typeof v === 'string' && v.trim() !== '');
+    const text = raw ? clip(raw, BIB_TRANSCRIPT_MESSAGE_MAX) : '';
+    if (!text) continue;
+    const who = [item.from, item.role, item.sender].find((v) => typeof v === 'string' && v.trim() !== '');
+    const entry = { from: who ? clip(who, 40) : '', text };
+    const at = typeof item.at === 'string' ? clip(item.at, 40) : '';
+    if (at) entry.at = at;
+    out.push(entry);
+  }
+  return out.length ? out : null;
+}
+
 function sanitiseExtra(extra) {
   const source = extra && typeof extra === 'object' && !Array.isArray(extra) ? extra : {};
-  return {
+  const out = {
     staffCount: shortOrNumber(source.staffCount, BIB_SHORT_MAX),
     logoReady: boolOrNull(source.logoReady),
     deadline: shortField(source.deadline, BIB_SHORT_MAX),
@@ -638,6 +669,10 @@ function sanitiseExtra(extra) {
     leadScore: shortOrNumber(source.leadScore, BIB_SHORT_MAX),
     consent: boolOrNull(source.consent),
   };
+  // Only present when the website sent the chat, so existing leads keep the same shape.
+  const transcript = sanitiseTranscript(source.transcript);
+  if (transcript) out.transcript = transcript;
+  return out;
 }
 
 function invalidBib(message) {

@@ -400,6 +400,46 @@ describe('B.I.B website leads', { concurrency: false }, () => {
     }
   });
 
+  test('the chat transcript is stored as a clean list of messages', async () => {
+    resetStore();
+    const res = await postBib(lead({
+      id: 'chat1',
+      extra: {
+        consent: true,
+        transcript: [
+          { from: 'Dana', text: 'Hi, do you do hoodies?' },
+          { role: 'bot', message: 'Yes we do!\u0000' },
+          { from: 'x', text: '   ' },
+          'a plain string message',
+          { from: 'F'.repeat(100), text: 'T'.repeat(1500) },
+          42,
+        ],
+      },
+    }));
+    assert.equal(res.status, 201);
+    const t = readFileLeads()[0].extra.transcript;
+    assert.deepEqual(t.slice(0, 3), [
+      { from: 'Dana', text: 'Hi, do you do hoodies?' },
+      { from: 'bot', text: 'Yes we do!' },
+      { from: '', text: 'a plain string message' },
+    ]);
+    assert.equal(t[3].from.length, 40);
+    assert.equal(t[3].text.length, 1000);
+    assert.equal(t.length, 4);
+  });
+
+  test('a long transcript keeps the newest 200 messages; no transcript leaves no key', async () => {
+    resetStore();
+    const many = Array.from({ length: 250 }, (_, i) => ({ from: 'v', text: 'm' + i }));
+    assert.equal((await postBib(lead({ id: 'long', extra: { transcript: many } }))).status, 201);
+    assert.equal((await postBib(lead({ id: 'none', extra: { transcript: [] } }))).status, 201);
+    const stored = readFileLeads();
+    const long = stored.find((l) => l.leadgenId === 'bib:long');
+    assert.equal(long.extra.transcript.length, 200);
+    assert.equal(long.extra.transcript[0].text, 'm50');
+    assert.equal('transcript' in stored.find((l) => l.leadgenId === 'bib:none').extra, false);
+  });
+
   test('field length limits, control characters, and extra keys', async () => {
     resetStore();
     const res = await postBib(lead({

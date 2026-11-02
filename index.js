@@ -9,7 +9,8 @@ const app = express();
 app.use(cors());
 // Keep the exact bytes of every JSON body: Meta and B.I.B sign the raw payload,
 // and the parsed object cannot be used to check that signature.
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+// 512kb: a B.I.B chat lead can carry the whole chat transcript (up to 200 messages), more than express's 100kb default.
+app.use(express.json({ limit: '512kb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // Webhook secrets, RELAY_API_KEY, and RELAY_LINK_SECRET are read from the
 // environment on each request. Shopify consent updates use the shop values below.
